@@ -13,6 +13,11 @@ from verifiers.v1.runtimes.base import (
     register,
 )
 from verifiers.v1.runtimes.docker import DockerConfig, DockerRuntime, DockerRuntimeInfo
+from verifiers.v1.runtimes.kubernetes import (
+    KubernetesConfig,
+    KubernetesRuntime,
+    KubernetesRuntimeInfo,
+)
 from verifiers.v1.runtimes.modal import ModalConfig, ModalRuntime, ModalRuntimeInfo
 from verifiers.v1.runtimes.prime import (
     PrimeConfig,
@@ -27,12 +32,16 @@ from verifiers.v1.runtimes.subprocess import (
 )
 
 RuntimeConfig = Annotated[
-    SubprocessConfig | DockerConfig | PrimeConfig | ModalConfig,
+    SubprocessConfig | DockerConfig | PrimeConfig | ModalConfig | KubernetesConfig,
     Field(discriminator="type"),
 ]
 
 RuntimeInfo = Annotated[
-    SubprocessRuntimeInfo | DockerRuntimeInfo | PrimeRuntimeInfo | ModalRuntimeInfo,
+    SubprocessRuntimeInfo
+    | DockerRuntimeInfo
+    | PrimeRuntimeInfo
+    | ModalRuntimeInfo
+    | KubernetesRuntimeInfo,
     Field(discriminator="type"),
 ]
 
@@ -44,6 +53,8 @@ def _runtime_cls(config: RuntimeConfig) -> type[Runtime]:
         return ModalRuntime
     if isinstance(config, DockerConfig):
         return DockerRuntime
+    if isinstance(config, KubernetesConfig):
+        return KubernetesRuntime
     return SubprocessRuntime
 
 
@@ -83,6 +94,9 @@ __all__ = [
     "DockerConfig",
     "DockerRuntime",
     "DockerRuntimeInfo",
+    "KubernetesConfig",
+    "KubernetesRuntime",
+    "KubernetesRuntimeInfo",
     "ModalConfig",
     "ModalRuntime",
     "ModalRuntimeInfo",
