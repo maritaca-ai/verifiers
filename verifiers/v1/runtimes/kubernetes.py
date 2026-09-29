@@ -53,6 +53,10 @@ _TRANSIENT = (
     "context deadline exceeded",
     "TLS handshake timeout",
     "unexpected EOF",
+    "i/o timeout",
+    "connection refused",
+    "the server is currently unable to handle the request",
+    "too many requests",
 )
 _EXEC_PREFIX = "command terminated with exit code "
 
@@ -81,6 +85,9 @@ class KubernetesConfig(BaseConfig):
     labels: dict[str, str] = Field(default_factory=dict)
     startup_timeout: float = Field(300.0, gt=0)
     """Seconds for the Pod to become Ready (cold image pulls dominate)."""
+    max_lifetime: float = Field(6 * 3600.0, gt=0)
+    """Pod `activeDeadlineSeconds`: a sandbox whose owner died without tearing it down
+    (env server killed mid-episode) stops consuming the cluster after this long."""
     exec_retries: int = Field(3, ge=0)
     """Retries for SHORT operations (write/read/infra `run`) on transient kubelet errors.
     The harness program itself (`run_program`) is never replayed."""
@@ -181,6 +188,7 @@ class KubernetesRuntime(Runtime):
             "containers": [container],
             "restartPolicy": "Never",
             "terminationGracePeriodSeconds": 1,
+            "activeDeadlineSeconds": int(self.config.max_lifetime),
         }
         if self.config.gvisor:
             spec["runtimeClassName"] = "gvisor"
@@ -198,9 +206,19 @@ class KubernetesRuntime(Runtime):
 
     async def start(self) -> None:
         manifest = json.dumps(self._manifest()).encode()
-        created = await self._kubectl("create", "-f", "-", stdin=manifest)
-        if created.exit_code != 0:
-            raise SandboxError(f"kubectl create pod failed: {created.stderr.strip()[-500:]}")
+        # The API server is reached over the network (public endpoint through NAT,
+        # or the private one): a burst of concurrent creates sees the occasional
+        # `dial tcp ...: i/o timeout` / TLS handshake timeout — retry the create
+        # itself with backoff (idempotent: a name clash means it did land).
+        for attempt in range(self.config.exec_retries + 1):
+            created = await self._kubectl("create", "-f", "-", stdin=manifest)
+            if created.exit_code == 0 or "AlreadyExists" in created.stderr:
+                break
+            if attempt == self.config.exec_retries or not self._transient(created):
+                raise SandboxError(f"kubectl create pod failed: {created.stderr.strip()[-500:]}")
+            logger.warning("kubernetes: create pod %s hit a transient API error (attempt %d): %s",
+                           self._pod, attempt + 1, created.stderr.strip()[-160:])
+            await asyncio.sleep(min(3 * 2 ** attempt, 20))
         self._created = True
         self.info.id = self._pod
         ready = await self._kubectl(
