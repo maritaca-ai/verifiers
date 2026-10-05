@@ -9,16 +9,18 @@ server; un-entered, each run brings its own."""
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Callable, Iterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager, nullcontext
-from dataclasses import dataclass
-from typing import Self
+from dataclasses import dataclass, replace
+from typing import Generic, Self, cast
+
+from typing_extensions import TypeVar
 
 from verifiers.v1.clients import (
     EvalClientConfig,
     ModelContext,
 )
-from verifiers.v1.configs.agent import AgentConfig, TimeoutConfig
+from verifiers.v1.configs.agent import AgentConfig, TimeoutConfig, agent_config_fields
 from verifiers.v1.configs.runtime import NetworkPolicyConfig
 from verifiers.v1.dialects import parse_message
 from verifiers.v1.harness import Harness
@@ -42,6 +44,7 @@ from verifiers.v1.types import (
     ToolMessage,
     UserMessage,
 )
+from verifiers.v1.utils.aio import run_shielded
 from verifiers.v1.utils.compile import (
     cap_remote_agent_timeout,
     resolve_runtime_config,
@@ -52,6 +55,26 @@ from verifiers.v1.utils.retries import backoff, trace_should_retry
 __all__ = ["Agent", "AgentConfig", "Agents", "TimeoutConfig", "make_agent"]
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_rollout_timeouts(timeout: TimeoutConfig, task: Task) -> RolloutTimeouts:
+    """Apply an agent's stage-timeout precedence to one task."""
+    return RolloutTimeouts(
+        setup=timeout.setup if timeout.setup is not None else task.data.timeout.setup,
+        agent=(
+            timeout.rollout if timeout.rollout is not None else task.data.timeout.agent
+        ),
+        finalize=(
+            timeout.finalize
+            if timeout.finalize is not None
+            else task.data.timeout.finalize
+        ),
+        scoring=(
+            timeout.scoring
+            if timeout.scoring is not None
+            else task.data.timeout.scoring
+        ),
+    )
 
 
 def _check_borrowed_placement(
@@ -116,19 +139,23 @@ class Segment:
     """One harness segment's agent/tool output, as `Interaction.turn` returns it.
 
     `messages` carries every model-sampled assistant message and intervening tool
-    result produced by the segment, in order; `last_reply` is quick sugar for its
-    final assistant text. `terminated` marks the exchange over — the run ended (a
+    result produced by the segment, in order. `root_reply` identifies the root
+    agent's response when the trace also contains descendant branches.
+    `terminated` marks the exchange over — the run ended (a
     limit, a `@stop`, or the harness finishing) instead of producing another
     segment; a terminated `Segment` carries no messages (the last real segment was
     already delivered), and the interaction's `trace` holds the full exchange.
     """
 
     messages: Messages
+    root_reply: str | None = None
     terminated: bool = False
 
     @property
     def last_reply(self) -> str:
-        """The final assistant message's text, matching `Trace.last_reply`."""
+        """The root agent's response, falling back to the final assistant message."""
+        if self.root_reply is not None:
+            return self.root_reply.strip()
         for message in reversed(self.messages):
             if isinstance(message, AssistantMessage):
                 return (message.content or "").strip()
@@ -210,7 +237,10 @@ class Interaction:
                     saw_assistant = True
                 elif saw_assistant and isinstance(node.message, ToolMessage):
                     segment_messages.append(node.message)
-            return Segment(messages=segment_messages)
+            return Segment(
+                messages=segment_messages,
+                root_reply=self.trace.root_reply,
+            )
         self._over = True
         return Segment(messages=[], terminated=True)
 
@@ -355,21 +385,26 @@ class Agent:
         runtime: Runtime | None = None,
         tools: Mapping[str, SharedToolServer] | None = None,
         on_trace: Callable[[Trace], None] | None = None,
+        collect_artifacts: bool = False,
     ) -> Trace:
         """Run this agent on `task` once and return the trace: one segment — the
         program runs on the task's prompt until it exits (a multi-turn exchange
         is `interaction()`). `runtime` places it into a live borrowed box instead of
         provisioning one; `tools` are live servers borrowed from their
         owner, counted in the pairing check; `on_trace` observes the trace the
-        moment it's minted, before any I/O. Retries whole while the trace ends
-        with a retryable error (`config.retries`) — never into a borrowed box;
-        the final trace keeps earlier attempts' errors."""
+        moment it's minted, before any I/O. `collect_artifacts` captures the task's
+        declared artifacts after its finalizer while its container runtime is still
+        alive. Retries whole while the trace ends with a retryable error
+        (`config.retries`) — never into a borrowed box; the final trace keeps earlier
+        attempts' errors."""
         if self._closed:
             raise RuntimeError("Agent is closed; create a new agent")
         retry = self.config.retries
         history: list = []
         for attempt in range(retry.max_retries + 1):
-            trace = await self._run_once(task, runtime, tools, on_trace)
+            trace = await self._run_once(
+                task, runtime, tools, on_trace, collect_artifacts
+            )
             if attempt == retry.max_retries or not trace_should_retry(trace, retry):
                 break
             if runtime is not None:
@@ -400,9 +435,20 @@ class Agent:
         runtime: Runtime | None,
         shared_tools: Mapping[str, SharedToolServer] | None,
         on_trace: Callable[[Trace], None] | None,
+        collect_artifacts: bool,
     ) -> Trace:
         params = self._rollout_params(task, runtime, dict(shared_tools or {}))
-        run = Rollout(task=task, on_trace=on_trace, **params)
+        if collect_artifacts and isinstance(params["runtime_config"], SubprocessConfig):
+            raise TypeError(
+                "artifact collection requires a container runtime; subprocess "
+                "artifacts live in a host-only temporary working directory"
+            )
+        run = Rollout(
+            task=task,
+            on_trace=on_trace,
+            collect_artifacts=collect_artifacts,
+            **params,
+        )
         try:
             if await run.open():
                 await run.step()
@@ -410,9 +456,8 @@ class Agent:
                     run.trace.stop("agent_completed")
             trace = await run.close()
         except BaseException:
-            # A cancellation mid-run (or a lifetime bug raised to the caller) means
-            # close() never runs — free the run's servers and owned runtime first.
-            await run.abort()
+            # Finish cleanup even if another cancellation arrives during abort().
+            await run_shielded(run.abort())
             raise
         if trace.agent.runtime is not None:
             trace.agent.runtime.borrowed = runtime is not None
@@ -488,6 +533,13 @@ class Agent:
     ) -> dict:
         """Resolve one run's runtime config, pairing checks, timeouts,
         interception — shared by `run` and `interaction`."""
+        harness = self.harness
+        skills = [*task.data.skills, *harness.config.skills]
+        if skills:
+            # Skill installations can hold run-specific state, such as RLM's package environment.
+            harness = type(harness)(
+                harness.config.model_copy(update={"skills": skills})
+            )
         if runtime is not None:
             _check_borrowed_placement(task, runtime, self.runtime_config)
             runtime_config = runtime.config
@@ -498,39 +550,20 @@ class Agent:
             )
             run_is_local = runtime_is_local(runtime_config)
         validate_pairing(
-            self.harness,
+            harness,
             type(task),
             runtime_config,
             tools=[*task.toolsets(task.config), *shared_tools.values()],
         )
-        # Timeout precedence: agent-level wins, else the task's, else no limit.
-        agent_timeout = (
-            self.timeout.rollout
-            if self.timeout.rollout is not None
-            else task.data.timeout.agent
-        )
+        timeouts = resolve_rollout_timeouts(self.timeout, task)
         return {
             "agent_config": self.config,
-            "harness": self.harness,
+            "harness": harness,
             "ctx": self.ctx,
             "runtime_config": runtime_config,
-            "timeouts": RolloutTimeouts(
-                setup=(
-                    self.timeout.setup
-                    if self.timeout.setup is not None
-                    else task.data.timeout.setup
-                ),
-                agent=cap_remote_agent_timeout(agent_timeout, runtime_config, task),
-                finalize=(
-                    self.timeout.finalize
-                    if self.timeout.finalize is not None
-                    else task.data.timeout.finalize
-                ),
-                scoring=(
-                    self.timeout.scoring
-                    if self.timeout.scoring is not None
-                    else task.data.timeout.scoring
-                ),
+            "timeouts": replace(
+                timeouts,
+                agent=cap_remote_agent_timeout(timeouts.agent, runtime_config, task),
             ),
             "limits": self.limits,
             "shared_tools": shared_tools,
@@ -619,6 +652,7 @@ class _EpisodeAgent(Agent):
         runtime: Runtime | None = None,
         tools: Mapping[str, SharedToolServer] | None = None,
         on_trace: Callable[[Trace], None] | None = None,
+        collect_artifacts: bool = False,
     ) -> Trace:
         async with self._gate or nullcontext():
             trace = await super().run(
@@ -626,6 +660,7 @@ class _EpisodeAgent(Agent):
                 runtime=runtime,
                 tools=tools if tools is not None else self._shared_for(task),
                 on_trace=self._watch(on_trace),
+                collect_artifacts=collect_artifacts,
             )
         self._completed.append(trace)
         return trace
@@ -678,27 +713,22 @@ def make_agent(
     return Agent(config, interception=interception)
 
 
-MakeAgent = Callable[[str, AgentConfig], Agent]
+AgentT = TypeVar("AgentT", bound=Agent, default=Agent)
+MakeAgent = Callable[[str, AgentConfig], AgentT]
 """An agent factory keyed by name — what `Agents` calls per scraped config field."""
 
 
-def agent_config_fields(config) -> dict[str, AgentConfig]:
-    """The top-level `AgentConfig` fields declared on a config, in declaration
-    order — the env's agents, keyed by field name (the only naming site)."""
-    return {name: value for name, value in config if isinstance(value, AgentConfig)}
-
-
-class Agents:
+class Agents(Generic[AgentT]):
     """A config's agents, addressed by attribute: every top-level `AgentConfig`
     field becomes an `Agent` under the field's name (`agents.solver`)."""
 
-    def __init__(self, config, make: MakeAgent | None = None) -> None:
-        self._agents: dict[str, Agent] = {
-            name: make_agent(value) if make is None else make(name, value)
+    def __init__(self, config, make: MakeAgent[AgentT] | None = None) -> None:
+        self._agents: dict[str, AgentT] = {
+            name: cast(AgentT, make_agent(value)) if make is None else make(name, value)
             for name, value in agent_config_fields(config).items()
         }
 
-    def __getattr__(self, name: str) -> Agent:
+    def __getattr__(self, name: str) -> AgentT:
         # self.__dict__ directly: attribute lookup re-entering __getattr__ before
         # __init__ ran (copy/unpickle) must raise, not recurse.
         agents = self.__dict__.get("_agents")
@@ -708,9 +738,3 @@ class Agents:
                 f"{sorted(agents) if agents else []}"
             )
         return agents[name]
-
-    def __iter__(self) -> Iterator[Agent]:
-        return iter(self._agents.values())
-
-    def __len__(self) -> int:
-        return len(self._agents)

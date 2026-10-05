@@ -42,14 +42,9 @@ class ProviderError(RolloutError):
         self.status_code = status_code
 
 
-class OverlongPromptError(ProviderError):
-    """The prompt exceeded the model's context window — a budget limit, ended as a clean
-    truncation rather than recorded as an error. Defaults to a 400 (what the interception
-    server surfaces for it — deterministic, so an SDK never retries it); `model_error`
-    keeps the provider's real status when the failure carried one."""
-
-    def __init__(self, message: str = "", *, status_code: int = 400) -> None:
-        super().__init__(message, status_code=status_code)
+MODEL_TRANSPORT_ERROR_EXIT_CODE = 97
+"""Reserved harness exit code for an exhausted model transport failure.
+`Harness._check_result` maps it to `InterceptionError`."""
 
 
 class HarnessError(RolloutError):
@@ -75,7 +70,7 @@ class TaskError(RolloutError):
 
 
 class InterceptionError(RolloutError):
-    """The host interception server (model calls + `/state` + `/task` channels) couldn't be reached."""
+    """Communication with the host interception server failed."""
 
 
 class TunnelError(InterceptionError):
@@ -87,8 +82,9 @@ async def boundary(error_cls: type[RolloutError], what: str) -> AsyncIterator[No
     """Run a framework→code boundary, attributing any error escaping it to `error_cls`. An
     already-typed `RolloutError` passes through unchanged — it crossed a more specific boundary
     first (e.g. a `SandboxError` from `runtime.run` inside a reward stays a `SandboxError`). A
-    `TimeoutError` (the stage exceeded its budget) becomes `error_cls` too. `what` names the
-    boundary in the error message."""
+    `TimeoutError` the code raises itself (its own I/O) becomes `error_cls` too; a stage
+    deadline wraps the boundary from outside, so its expiry is a timeout, not an error.
+    `what` names the boundary in the error message."""
     try:
         yield
     except RolloutError:
@@ -99,18 +95,12 @@ async def boundary(error_cls: type[RolloutError], what: str) -> AsyncIterator[No
         raise error_cls(f"{what}: {type(e).__name__}: {e}") from e
 
 
-_CONTEXT_LENGTH_PHRASES = (
-    "this model's maximum context length is",
-    "is longer than the model's context length",
-    "is longer than the maximum model length",
-    "exceeds the model's context length",
-    "exceed the configured limit",
-    "exceeds the configured limit",
-    "exceeded model",
-    "prompt_too_long",
-    "context length",
-    "maximum model length",
-)
+def stop_condition(error: BaseException) -> str:
+    """The stop condition a recorded error leaves on the trace: `<boundary>_error` for
+    a typed rollout error (`SandboxError` -> `sandbox_error`), `error` for any other."""
+    if isinstance(error, RolloutError):
+        return f"{type(error).__name__.removesuffix('Error').lower()}_error"
+    return "error"
 
 
 def _provider_status(e: OpenAIError | str) -> int:
@@ -130,23 +120,12 @@ def _provider_status(e: OpenAIError | str) -> int:
 def model_error(
     e: OpenAIError | str, *, status_code: int | None = None
 ) -> ProviderError:
-    """Map a provider failure to our error type: an overlong prompt (a budget limit the interception
-    server turns into a clean truncation) is told apart from any other provider call failure, which
-    becomes a plain `ProviderError`. `status_code` is the HTTP status surfaced to the harness (whose
-    SDK then retries 5xx/429/timeout and not 4xx); derived from an SDK error when not given. Accepts
-    an SDK error (the renderer) or the provider's raw error body (the httpx proxy)."""
-    from openai import APIStatusError
-
+    """Map a provider failure to a `ProviderError`. `status_code` is the HTTP status surfaced to
+    the harness (whose SDK then retries 5xx/429/timeout and not 4xx); derived from an SDK error
+    when not given. Accepts an SDK error (the renderer) or the provider's raw error body (the
+    httpx proxy)."""
     # Some SDK errors stringify empty; fall back to the type so the message is never blank.
     text = str(e) or (type(e).__name__ if isinstance(e, BaseException) else "")
-    if any(phrase in text.casefold() for phrase in _CONTEXT_LENGTH_PHRASES):
-        # Keep the provider's real status when the failure carried one; else the class
-        # default (the 400 the interception server surfaces for overlong prompts).
-        if status_code is None and isinstance(e, APIStatusError):
-            status_code = e.status_code
-        return OverlongPromptError(
-            text, **({} if status_code is None else {"status_code": status_code})
-        )
     return ProviderError(
         text,
         status_code=status_code if status_code is not None else _provider_status(e),

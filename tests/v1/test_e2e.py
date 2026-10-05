@@ -5,6 +5,10 @@ combinations a test runs — every axis value at least once plus the cross-bound
 with distinct networking — instead of fanning the full cross product. prime/modal rows
 are local-only (their marks are excluded in CI)."""
 
+import shutil
+import subprocess
+import sys
+
 import pytest
 
 mark = pytest.mark
@@ -13,6 +17,113 @@ mark = pytest.mark
 def pair(a: str, b: str, id: str, *extra_marks):
     marks = [getattr(mark, a.replace("-", "_")), getattr(mark, b.replace("-", "_"))]
     return pytest.param(a, b, marks=[*marks, *extra_marks], id=id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interruption", [None, "disconnect", "timeout", "eof"])
+async def test_chat_harness_preserves_streamed_reasoning(interruption):
+    import json
+
+    import httpx
+    from openai import AsyncOpenAI
+
+    from verifiers.v1.harnesses.utils.core import chat
+
+    def chunk(text: str, finish_reason: str | None = None) -> dict:
+        return {
+            "id": "chatcmpl-test",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "test-model",
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "role": "assistant",
+                        "reasoning": text,
+                        "reasoning_content": text,
+                        "reasoning_details": [
+                            {
+                                "type": "reasoning.text",
+                                "index": 0,
+                                "id": "r1",
+                                "format": "unknown",
+                                "signature": "sig",
+                                "text": text,
+                            }
+                        ],
+                    },
+                    "finish_reason": finish_reason,
+                }
+            ],
+        }
+
+    events = [chunk("Plan: "), chunk("call ls", "stop")]
+    content = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
+    content += "data: [DONE]\n\n"
+
+    requests = []
+    streams = []
+
+    class CompletionStream(httpx.AsyncByteStream):
+        closed = False
+
+        def __init__(self, request, interrupted):
+            self.request = request
+            self.interrupted = interrupted
+
+        async def __aiter__(self):
+            if self.interrupted:
+                yield f"data: {json.dumps(chunk('discard this attempt'))}\n\n".encode()
+                if interruption == "disconnect":
+                    raise httpx.ReadError("connection reset", request=self.request)
+                if interruption == "timeout":
+                    raise httpx.ReadTimeout("read timed out", request=self.request)
+                return
+            yield content.encode()
+
+        async def aclose(self):
+            self.closed = True
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        stream = CompletionStream(request, interruption and len(requests) == 1)
+        streams.append(stream)
+        return httpx.Response(
+            200,
+            stream=stream,
+            headers={"content-type": "text/event-stream"},
+            request=request,
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http_client:
+        client = AsyncOpenAI(
+            api_key="test",
+            base_url="https://example.test/v1",
+            http_client=http_client,
+        )
+        completion = await chat(client, "test-model", [], [])
+
+    assert len(requests) == (2 if interruption else 1)
+    assert [r.headers["x-stainless-retry-count"] for r in requests] == (
+        ["0", "1"] if interruption else ["0"]
+    )
+    assert all(r.content == requests[0].content for r in requests)
+    assert all(stream.closed for stream in streams)
+    message = completion.choices[0].message.model_dump(exclude_none=True)
+    assert message["role"] == "assistant"
+    assert message["reasoning"] == "Plan: call ls"
+    assert message["reasoning_content"] == "Plan: call ls"
+    assert message["reasoning_details"] == [
+        {
+            "type": "reasoning.text",
+            "index": 0,
+            "id": "r1",
+            "format": "unknown",
+            "signature": "sig",
+            "text": "Plan: call ls",
+        }
+    ]
 
 
 # harness x harness runtime: every harness once, both local runtimes hit (subprocess
@@ -38,6 +149,15 @@ CHAT_PLACEMENTS = [
 # remote row per provider.
 AGENTIC_PLACEMENTS = [
     pair("bash", "subprocess", "bash-harness-in-subprocess"),
+    *[
+        pair(
+            "bash",
+            engine,
+            f"bash-harness-in-{engine}",
+            mark.skipif(shutil.which(engine) is None, reason=f"needs {engine}"),
+        )
+        for engine in ("podman", "apptainer")
+    ],
     pair("rlm", "docker", "rlm-harness-in-docker"),
     pytest.param(
         {"id": "kimi-code", "transport": "responses"},
@@ -50,6 +170,12 @@ AGENTIC_PLACEMENTS = [
     pair("hermes-agent", "docker", "hermes-agent-harness-in-docker"),
     pair("bash", "prime", "bash-harness-in-prime"),
     pair("bash", "modal", "bash-harness-in-modal"),
+    pytest.param(
+        "bash",
+        {"type": "modal", "allow": []},
+        marks=[mark.bash, mark.modal],
+        id="bash-harness-in-modal-framework-only",
+    ),
 ]
 
 # The scripted user runs in the eval process itself (no placement axis); the harness
@@ -65,6 +191,15 @@ USER_RUNTIMES = [
 # retain MCP access after resuming. Cover every harness in the local container runtime,
 # plus remote placements for the sandbox/tunnel and native-process boundaries.
 ACP_RESUME_PLACEMENTS = [
+    *[
+        pair(
+            "rlm",
+            engine,
+            f"rlm-acp-in-{engine}",
+            mark.skipif(shutil.which(engine) is None, reason=f"needs {engine}"),
+        )
+        for engine in ("podman", "apptainer")
+    ],
     pair("codex", "docker", "codex-acp-in-docker"),
     pair("claude-code", "docker", "claude-code-acp-in-docker"),
     pair("hermes-agent", "docker", "hermes-agent-acp-in-docker"),
@@ -81,16 +216,29 @@ ACP_RESUME_PLACEMENTS = [
         marks=[mark.pi, mark.docker],
         id="pi-responses-acp-in-docker",
     ),
-    pair("pool", "docker", "pool-acp-in-docker"),
     pair("openclaw", "docker", "openclaw-acp-in-docker"),
-    pair("pool", "prime", "pool-acp-in-prime"),
     pair("rlm", "prime", "rlm-acp-in-prime-vm"),
+    pytest.param(
+        "prime-agent",
+        "prime",
+        marks=[mark.prime],
+        id="prime-agent-acp-in-prime-vm",
+    ),
 ]
 
 # harness runtime x tool placement: every axis value once plus the two-container case
 # (harness and tool in separate docker boxes) and a prime-colocated row (a tool in its
 # OWN prime sandbox needs port exposure; colocated rides the harness's box).
 TOOL_PLACEMENTS = [
+    *[
+        pair(
+            "subprocess",
+            engine,
+            f"harness-in-subprocess-with-tool-in-{engine}",
+            mark.skipif(shutil.which(engine) is None, reason=f"needs {engine}"),
+        )
+        for engine in ("podman", "apptainer")
+    ],
     pair("subprocess", "colocated", "harness-in-subprocess-with-tool-colocated"),
     pair("docker", "colocated", "harness-in-docker-with-tool-colocated"),
     pair("subprocess", "docker", "harness-in-subprocess-with-tool-in-docker"),
@@ -241,10 +389,7 @@ async def test_acp_resume_with_tool(run_v1, harness, harness_runtime, tmp_path):
     (trace,) = await run_v1(
         "echo-acp-resume-v1",
         harness=harness,
-        runtime={
-            "type": harness_runtime,
-            **({"vm": True} if harness_runtime == "prime" else {}),
-        },
+        runtime={"type": harness_runtime},
         output_dir=tmp_path,
         max_turns=8,
         max_tokens=8192,
@@ -257,15 +402,42 @@ async def test_acp_resume_with_tool(run_v1, harness, harness_runtime, tmp_path):
     assert len(segments) == 2
     assert segments[0]["terminated"] is False
     assert segments[1]["terminated"] is False
+    assert trace.root_reply == segments[1]["last_reply"]
     # Kimi Code is broken upstream: its Responses adapter drops message `phase` on replay.
     if harness.id != "kimi-code":
         assert trace.num_branches == 1
-    # Native MCP tools need not appear in the intercepted model request that
-    # populates trace.tools; the ACP transcript is the source of truth for use.
     assert "tool" in segments[1]["roles"]
     assert segments[1]["tool_outputs"]
+    if harness.id == "pi":
+        recall = next(tool for tool in trace.tools if tool.name == "resume_recall")
+        assert recall.parameters["properties"]["codeword"]["type"] == "string"
+        assert "codeword" in recall.parameters["required"]
+    if harness.id == "codex":
+        recall = next(tool for tool in trace.tools if tool.name.endswith("recall"))
+        assert recall.namespace
+        assert "codeword" in recall.parameters["properties"]
+        assert any(
+            call.namespace == recall.namespace and call.name == recall.name
+            for message in trace.assistant_messages
+            for call in message.tool_calls or []
+        )
     if harness.id == "rlm":
         assert "turns_since_last_compaction" in trace.metrics
+        assert all(call.acp is not None for call in trace.calls)
+        assert all(
+            trace.nodes[parent.node].sampled and node.sampled
+            for node in trace.nodes
+            for parent in node.semantic_parents
+        )
+    if harness.id == "prime-agent":
+        lifecycle = trace.info["acp_lifecycle"]["ai.primeintellect.prime-agent"]
+        assert len(lifecycle) == 2
+        for status in lifecycle:
+            assert status["infrastructure_status"] == "ok"
+            assert status["terminal_quiescence_observed"] is True
+            assert (
+                status["terminal_quiescence"]["quiescence"]["outstandingSubagents"] == 0
+            )
 
 
 @pytest.mark.e2e
@@ -382,7 +554,7 @@ async def test_rubric_judge(run_v1, tmp_path):
     assert trace.ok
     assert trace.rewards["rubric"].score > 0  # the judge's verdict landed in the reward
     assert trace.metrics["rubric/always_yes"] == 1.0
-    assert trace.info["judge"]  # the call was recorded onto the trace
+    assert trace.info["judge_calls"]  # the call was recorded onto the trace
 
 
 @pytest.mark.e2e
@@ -392,7 +564,9 @@ async def test_agentic(run_v1, harness, harness_runtime, tmp_path):
     (trace,) = await run_v1(
         "echo-agentic-v1",
         harness=harness,
-        runtime={"type": harness_runtime},
+        runtime=harness_runtime
+        if isinstance(harness_runtime, dict)
+        else {"type": harness_runtime},
         output_dir=tmp_path,
         max_turns=10,
         max_tokens=8192,
@@ -566,8 +740,8 @@ async def test_env_id_user_sim(run_v1, tmp_path):
     # both sides land as ONE durable episode.
     assert assistant.task.data.prompt is None
     assert "echoed" in assistant.rewards
-    from verifiers.v1.cli.output import read_episodes
     from verifiers.v1.trace import WireTrace
+    from verifiers.v1.utils.trace_store import read_episodes
 
     (record,) = read_episodes(tmp_path, WireTrace)
     assert {t.agent.name for t in record.traces} == {"assistant", "user"}
@@ -653,6 +827,37 @@ async def test_multi_agent_env_server(run_v1_server, tmp_path):
         assert trace.metrics["duet"] == 1.0
 
 
+# `_request` parks a cancelled run's fire-and-forget cancel in `_cancel_tasks` with a
+# `discard` done-callback. One loop turn later the sends have finished but the callbacks
+# are still queued behind us, so `close()` meets a set of finished tasks.
+CLOSE_WITH_FINISHED_CANCELS = """
+import asyncio, uuid
+from verifiers.v1.serve.client import EnvClient
+
+async def main():
+    client = EnvClient("tcp://127.0.0.1:1")
+    for _ in range(3):
+        task = asyncio.get_running_loop().create_task(client._send_cancel(uuid.uuid4().hex))
+        client._cancel_tasks.add(task)
+        task.add_done_callback(client._cancel_tasks.discard)
+    await asyncio.sleep(0)
+    assert all(task.done() for task in client._cancel_tasks) and client._cancel_tasks
+    await client.close()
+
+asyncio.run(main())
+"""
+
+
+def test_env_client_close_drains_finished_cancels():
+    """`close()` returns once every fire-and-forget cancel has run, also when all of them
+    finished before it looked: the state Ctrl-C leaves behind in served mode. A child
+    process bounds the check, since a `close()` that never yields to the loop never lets
+    an in-loop timeout fire either."""
+    subprocess.run(
+        [sys.executable, "-c", CLOSE_WITH_FINISHED_CANCELS], check=True, timeout=30
+    )
+
+
 @pytest.mark.e2e
 async def test_replay_round_trip(run_v1, tmp_path):
     """eval -> replay -> replay-the-replay. Offline re-scoring must preserve the saved
@@ -679,11 +884,29 @@ async def test_replay_round_trip(run_v1, tmp_path):
     assert source.ok
     assert "lcs" in source.rewards
 
+    # Replay must not mix the source run's judge transcript into newly computed
+    # judge calls. Seed a saved call directly because this task scores without a
+    # judge; cleanup happens before task scoring and therefore does not inspect it.
+    import json
+
+    stream = run_dir / "traces.jsonl"
+    record = json.loads(stream.read_text())
+    record["traces"][0]["info"]["judge_calls"] = [
+        {
+            "name": "source-judge",
+            "request": {"model": "source-model", "messages": []},
+            "response": {
+                "message": {"role": "assistant", "content": "stale"},
+                "parsed": None,
+                "usage": None,
+            },
+        }
+    ]
+    stream.write_text(json.dumps(record) + "\n")
+
     async def replay(source_dir: Path, out: Path):
         # The CLI's layering, minus the argv plumbing: the saved run's config is the base
         # (`ReplayConfig` ignores its eval-only keys), the source's output_dir is dropped.
-        import json
-
         data = json.loads(saved_config_path(source_dir).read_text())
         data.pop("output_dir", None)
         config = ReplayConfig(**{**data, "rich": False})
@@ -698,6 +921,7 @@ async def test_replay_round_trip(run_v1, tmp_path):
         # and recomputed the same value.
         assert replayed.rewards.keys() == source.rewards.keys()
         assert replayed.reward == pytest.approx(source.reward)
+        assert "judge_calls" not in replayed.info
     # The wire task keeps its taskset-specific fields in the replay's own output.
     raw = (tmp_path / "replay2" / "traces.jsonl").read_text()
     assert '"answer"' in raw

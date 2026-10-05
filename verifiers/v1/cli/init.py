@@ -8,7 +8,7 @@ from pydantic_config import cli
 from verifiers.v1.configs.cli.init import InitConfig
 
 USAGE = (
-    "usage: uv run init <name> [--path ./environments] [-T/--add-tool] "
+    "usage: uv run vf-init <name> [--path ./environments] [-T/--add-tool] "
     "[-H/--add-harness]\n"
     "       scaffold a new environment package"
 )
@@ -109,7 +109,7 @@ class {prefix}Taskset(vf.Taskset[{prefix}Task, {prefix}Config]):
     def load(self) -> list[{prefix}Task]:
         raise NotImplementedError(
             "Return this taskset's tasks, e.g. "
-            "[{prefix}Task({prefix}Data(idx=i, prompt=...), self.config.task) "
+            "[{prefix}Task({prefix}Data(prompt=...), self.config.task) "
             "for i in range(self.config.num_tasks)]."
         )
 '''
@@ -191,7 +191,7 @@ A v1 verifiers environment, scaffolded with `init`.
 
 ```bash
 uv pip install -e .        # install this package (or register it in your project)
-uv run eval {dash} -n 3    # evaluate a few tasks with the bash harness
+uv run vf-eval {dash} -n 3    # evaluate a few tasks with the bash harness
 ```
 
 ## Layout
@@ -228,7 +228,7 @@ def scaffold(config: InitConfig) -> Path:
         _write(pkg_dir / "servers" / "__init__.py", "")
         _write(pkg_dir / "servers" / "tool.py", _tool_py(stem, prefix))
 
-    print(f"\ndone. next:\n  uv pip install -e {env_dir}\n  uv run eval {dash} -n 3")
+    print(f"\ndone. next:\n  uv pip install -e {env_dir}\n  uv run vf-eval {dash} -n 3")
     return env_dir
 
 

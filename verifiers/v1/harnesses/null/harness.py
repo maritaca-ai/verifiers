@@ -1,15 +1,13 @@
-import json
-from pathlib import Path
-
 from verifiers.v1.clients import ModelContext
 from verifiers.v1.configs.harness import HarnessConfig
-from verifiers.v1.dialects.chat import message_to_wire
 from verifiers.v1.harness import Harness
+from verifiers.v1.harnesses.utils.launch import (
+    CHAT_PROGRAM_SOURCE,
+    launch_chat_program,
+)
 from verifiers.v1.runtimes import ProgramResult, Runtime
 from verifiers.v1.task import TaskData
 from verifiers.v1.trace import Trace
-
-PROGRAM_SOURCE = (Path(__file__).resolve().parent / "program.py").read_text()
 
 
 class NullHarnessConfig(HarnessConfig):
@@ -20,11 +18,12 @@ class NullHarness(Harness[NullHarnessConfig]):
     APPENDS_SYSTEM_PROMPT = True
     SUPPORTS_MCP = True
     SUPPORTS_RESUME = True
+    SUPPORTS_TOOL_INTERCEPTION = True
     EXECUTES_CODE = False
     NEEDS_CONTAINER = False
 
     async def setup(self, runtime: Runtime) -> None:
-        await runtime.prepare_uv_script(PROGRAM_SOURCE, self.config.resolved_env)
+        await runtime.prepare_uv_script(CHAT_PROGRAM_SOURCE, self.config.resolved_env)
 
     async def launch(
         self,
@@ -35,41 +34,21 @@ class NullHarness(Harness[NullHarnessConfig]):
         secret: str,
         mcp_urls: dict[str, str],
         data: TaskData,
+        tool_interception_url: str | None = None,
     ) -> ProgramResult:
         system_prompt, prompt = self.resolve_prompt(data)
-        env = {**self.config.resolved_env}
-        args = [
-            f"--base-url={endpoint}",
-            f"--api-key={secret}",
-            f"--model={ctx.model}",
-        ]
-        if system_prompt:
-            args.append(f"--system-prompt={system_prompt}")
-        if mcp_urls:
-            # The program connects to the tool servers over HTTP; hand it a standard
-            # `mcpServers` URL config (the `mcp` client itself comes from the uv deps).
-            args.append(
-                "--mcp-config="
-                + json.dumps(
-                    {
-                        "mcpServers": {
-                            name: {"url": url, "timeout": self.config.tool_timeout}
-                            for name, url in mcp_urls.items()
-                        }
-                    }
-                )
-            )
-        if isinstance(prompt, str):
-            args.append(f"--prompt={prompt}")
-        elif prompt is not None:
-            # Base64 images can exceed exec limits, so hand Messages off through a file.
-            path = f".vf-initial-messages-{trace.id}.json"
-            await runtime.write(
-                path,
-                json.dumps([message_to_wire(m) for m in prompt]).encode(),
-            )
-            args.append(f"--initial-messages-file={path}")
-        program = await runtime.prepare_uv_script(
-            PROGRAM_SOURCE, self.config.resolved_env
+        return await launch_chat_program(
+            CHAT_PROGRAM_SOURCE,
+            self.config,
+            ctx,
+            trace,
+            runtime,
+            endpoint,
+            secret,
+            mcp_urls,
+            system_prompt,
+            prompt,
+            extra_args=[f"--tool-interception-url={tool_interception_url}"]
+            if tool_interception_url
+            else (),
         )
-        return await runtime.run_program([*program, *args], env)

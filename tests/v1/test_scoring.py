@@ -89,6 +89,19 @@ async def test_config_plugged_fns_merge_and_override(tmp_path) -> None:
         HookTask(HookData(idx=0, prompt="abc"), config).hooks("reward")
 
 
+async def test_defer_scoring_defers_only_task_scoring() -> None:
+    task = HookTask(HookData(idx=0, prompt="abc"))
+    trace = vf.Trace(
+        agent=vf.AgentInfo(config=vf.AgentConfig()),
+        task=vf.TraceTask(type="HookTask", data=task.data),
+    )
+
+    await task.defer_scoring().score(trace)
+    assert trace.rewards == {}
+    await task.score(trace)
+    assert set(trace.rewards) == {"fmt", "lcs"}
+
+
 def test_compare_stdout_results_accepts_token_equal_text() -> None:
     assert vf.compare_stdout_results("hello   world\n", "hello world\n")
 
@@ -113,7 +126,39 @@ def test_parse_pytest_outcomes_strips_xfail_xpass_reasons() -> None:
     }
 
 
-def test_parse_judge_choice_uses_first_choice_after_verdict_marker() -> None:
-    response = "Final Judgment: B because it is a better answer"
-
-    assert vf.parse_judge_choice(response, choices=("A", "B")) == "B"
+def test_parse_judge_choice_prefers_final_marker_then_boxed() -> None:
+    assert (
+        vf.parse_judge_choice(
+            "Draft: \\boxed{A}\nFinal Judgment: B", choices=("A", "B")
+        )
+        == "B"
+    )
+    assert (
+        vf.parse_judge_choice(
+            "Draft: \\boxed{A}\nFinal Judgment:\nReasoning mentions B",
+            choices=("A", "B"),
+        )
+        == "A"
+    )
+    assert (
+        vf.parse_judge_choice(
+            "Draft: \\boxed{B}\nFinal Judgment: This is a \\boxed{B}",
+            choices=("A", "B"),
+        )
+        == "B"
+    )
+    assert (
+        vf.parse_judge_choice(
+            "Final Judgment: A better choice is \\boxed{B}", choices=("A", "B")
+        )
+        == "A"
+    )
+    assert (
+        vf.parse_judge_choice(
+            "Final Judgment: \\boxed{A}\nFinal Judgment: B", choices=("A", "B")
+        )
+        == "B"
+    )
+    assert (
+        vf.parse_judge_choice("Draft: \\boxed{A}\nAnswer: B", choices=("A", "B")) == "A"
+    )

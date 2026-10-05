@@ -9,7 +9,7 @@
 ## Running code
 
 - **Always use uv**: run code and commands with `uv run`, never raw `python`. Make sure `uv` is installed ([docs](https://docs.astral.sh/uv/getting-started/installation/)).
-- **Scaffold environments**: create a new taskset/environment with `uv run init <name>` (`uv run init -h` lists options like `-T`/`-H`), and run evals with `uv run eval <taskset>`.
+- **Scaffold environments**: create a new taskset/environment with `uv run vf-init <name>` (`uv run vf-init -h` lists options like `-T`/`-H`), and run evals with `uv run vf-eval <taskset>`.
 - **Validate TOML first**: validate config `.toml` files before running them.
 - **Don't add dependencies**: never add dependencies or optional extras to the top-level `pyproject.toml`.
 
@@ -20,9 +20,9 @@
 
 ## Skills
 
-- **Use bundled skills first**: the skills in `skills/` cover the core workflows — `create-environments` (build or migrate a v1 taskset/environment/harness), `evaluate-environments` (configure and run evals), and `brainstorm` (ideation and research planning). Reach for them before doing the work by hand.
+- **Use bundled skills first**: the skills in `skills/` cover the core workflows — `create-environments` (build or migrate a v1 taskset/environment/harness), `evaluate-environments` (configure and run evals), `release` (publish stable versions), and `brainstorm` (ideation and research planning). Reach for them before doing the work by hand.
 
 ## Testing
 
 - **Prefer e2e tests over unit tests**: v1's end-to-end tests are sufficient — extra unit tests clog the repo. Editing existing tests is fine; to check your own work, write a temporary script instead of committing new tests.
-- **Run the contributor checks**: run `uv run pre-commit install` once, then for touched areas `uv run ruff check --fix .`, `uv run pytest tests/`, and `uv run pre-commit run --all-files` (see `docs/legacy/development.md`).
+- **Run the contributor checks**: run `uv run pre-commit install` once, then for touched areas `uv run ruff check --fix .`, `uv run pytest tests/`, and `uv run pre-commit run --all-files`.

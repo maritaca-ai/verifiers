@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.10,<3.15"
-# dependencies = ["agent-client-protocol==0.12.1"]
+# dependencies = ["agent-client-protocol==0.12.1", "httpx"]
 # ///
 """Run harness segments through an ACP agent."""
 
@@ -11,8 +11,10 @@ import signal
 import sys
 import traceback
 from contextlib import AsyncExitStack, suppress
+from dataclasses import asdict, dataclass
 from typing import Any
 
+import httpx
 from acp import (
     PROTOCOL_VERSION,
     Client,
@@ -26,6 +28,7 @@ from acp.schema import (
     AllowedOutcome,
     ClientCapabilities,
     DeniedOutcome,
+    HttpHeader,
     HttpMcpServer,
     PermissionOption,
     RequestPermissionResponse,
@@ -35,16 +38,77 @@ from acp.schema import (
 MAX_PACKET_BYTES = 128 * 1024 * 1024
 
 
+@dataclass(frozen=True)
+class ACPTurn:
+    reply: str
+    stop_reason: str | None
+    response_metadata: dict[str, Any]
+    update_metadata: list[dict[str, Any]]
+
+
+class ToolGate:
+    """The rollout's `/tool` gate, asked before every tool call the agent wants to run."""
+
+    def __init__(self, url: str, secret: str) -> None:
+        self.url = url
+        self.client = httpx.AsyncClient(
+            headers={"Authorization": f"Bearer {secret}"},
+            timeout=httpx.Timeout(120, connect=5),
+        )
+
+    async def decision(self, tool_call_id: str, arguments: Any) -> str:
+        try:
+            # pi-acp wraps extension confirmations in a separate UI permission call.
+            if (
+                tool_call_id.startswith("pi-ui-")
+                and isinstance(arguments, dict)
+                and arguments.get("method") == "confirm"
+            ):
+                tool_call_id, arguments = (
+                    arguments["title"],
+                    json.loads(arguments["message"]),
+                )
+            response = await self.client.post(
+                self.url, json={"tool_call_id": tool_call_id, "arguments": arguments}
+            )
+            response.raise_for_status()
+            return response.json()["action"]
+        except Exception as error:  # noqa: BLE001 - an unreachable gate lets nothing run
+            print(f"tool gate denied {tool_call_id}: {error}", file=sys.stderr)
+            return "deny"
+
+
 class VerifiersACPClient(Client):
     def __init__(self) -> None:
+        self.gate: ToolGate | None = None
+        self.prompt_task: asyncio.Task | None = None
         self.visible_reply = ""
         self.message_id: str | None = None
+        self.stop_reason: str | None = None
+        self.response_metadata: dict[str, Any] = {}
+        self.update_metadata: list[dict[str, Any]] = []
 
     def reset(self) -> None:
         self.visible_reply = ""
         self.message_id = None
+        self.stop_reason = None
+        self.response_metadata = {}
+        self.update_metadata = []
+
+    def turn_result(self) -> ACPTurn:
+        return ACPTurn(
+            reply=self.visible_reply,
+            stop_reason=self.stop_reason,
+            response_metadata=self.response_metadata,
+            update_metadata=self.update_metadata,
+        )
 
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
+        metadata = dict(kwargs)
+        if isinstance(field_meta := getattr(update, "field_meta", None), dict):
+            metadata.update(field_meta)
+        if metadata:
+            self.update_metadata.append(metadata)
         if isinstance(update, AgentMessageChunk) and isinstance(
             update.content, TextContentBlock
         ):
@@ -61,9 +125,23 @@ class VerifiersACPClient(Client):
         options: list[PermissionOption],
         **kwargs: Any,
     ) -> RequestPermissionResponse:
+        """Ask the rollout before execution: deny rejects one call; stop cancels the turn."""
+        kinds = ("allow_once", "allow_always")
+        if self.gate is not None:
+            decision = await self.gate.decision(
+                tool_call.tool_call_id, tool_call.raw_input
+            )
+            if decision == "stop":
+                self.stop_reason = "cancelled"
+                if self.prompt_task is not None:
+                    self.prompt_task.cancel()
+                return RequestPermissionResponse(
+                    outcome=DeniedOutcome(outcome="cancelled")
+                )
+            if decision != "allow":
+                kinds = ("reject_once", "reject_always")
         option = next(
-            (item for item in options if item.kind in ("allow_once", "allow_always")),
-            None,
+            (item for kind in kinds for item in options if item.kind == kind), None
         )
         outcome = (
             AllowedOutcome(outcome="selected", option_id=option.option_id)
@@ -104,7 +182,15 @@ def user_content_blocks(contents: list, supports_images: bool) -> list:
 
 def mcp_servers(config: dict) -> list[HttpMcpServer]:
     return [
-        HttpMcpServer(type="http", name=name, url=url, headers=[])
+        HttpMcpServer(
+            type="http",
+            name=name,
+            url=url,
+            headers=[
+                HttpHeader(name=key, value=value)
+                for key, value in config.get("mcp_headers", {}).get(name, {}).items()
+            ],
+        )
         for name, url in config["mcp_urls"].items()
     ]
 
@@ -117,7 +203,8 @@ async def prompt(
     config: dict,
     *,
     is_new: bool,
-) -> str:
+) -> ACPTurn:
+    client.reset()
     prompt_capabilities = capabilities and capabilities.prompt_capabilities
     supports_images = bool(prompt_capabilities and prompt_capabilities.image)
     blocks = []
@@ -126,13 +213,20 @@ async def prompt(
     blocks.extend(user_content_blocks(config["user_contents"], supports_images))
     if not blocks:
         raise ValueError("ACP prompt has no content")
-    client.reset()
     try:
-        await connection.prompt(session_id=session_id, prompt=blocks)
-    except RequestError as error:
-        detail = error.data.get("details") if isinstance(error.data, dict) else None
-        raise RuntimeError(detail or str(error)) from error
-    return client.visible_reply
+        client.prompt_task = asyncio.create_task(
+            connection.prompt(session_id=session_id, prompt=blocks)
+        )
+        response = await client.prompt_task
+        client.stop_reason = response.stop_reason
+        client.response_metadata = dict(response.field_meta or {})
+    except asyncio.CancelledError:
+        if client.stop_reason != "cancelled":
+            raise
+        await connection.cancel(session_id=session_id)
+    finally:
+        client.prompt_task = None
+    return client.turn_result()
 
 
 class ACPSession:
@@ -164,7 +258,9 @@ class ACPSession:
             self.connection = agent_process[0]
             initialized = await self.connection.initialize(
                 protocol_version=PROTOCOL_VERSION,
-                client_capabilities=ClientCapabilities(),
+                client_capabilities=ClientCapabilities.model_validate(
+                    config["client_capabilities"]
+                ),
             )
             self.capabilities = initialized.agent_capabilities
             session = await self.connection.new_session(
@@ -180,11 +276,14 @@ class ACPSession:
         self.session_id = session.session_id
         self.is_new = True
 
-    async def run(self, config: dict) -> str:
+    async def run(self, config: dict) -> ACPTurn:
+        gate = config.get("tool_interception")
+        if gate and self.client.gate is None:
+            self.client.gate = ToolGate(gate["url"], gate["secret"])
         if self.connection is None:
             await self.start(config)
         assert self.session_id is not None
-        reply = await prompt(
+        result = await prompt(
             self.client,
             self.connection,
             self.capabilities,
@@ -193,9 +292,10 @@ class ACPSession:
             is_new=self.is_new,
         )
         self.is_new = False
-        return reply
+        return result
 
-    async def close(self) -> None:
+    async def close(self) -> dict[str, Any]:
+        response_metadata: dict[str, Any] = {}
         try:
             if self.connection is not None and self.session_id is not None:
                 session_capabilities = (
@@ -203,10 +303,19 @@ class ACPSession:
                 )
                 if session_capabilities and session_capabilities.close is not None:
                     with suppress(Exception):
-                        await self.connection.close_session(session_id=self.session_id)
-            await self.stack.aclose()
+                        response = await self.connection.close_session(
+                            session_id=self.session_id
+                        )
+                        response_metadata = dict(response.field_meta or {})
         finally:
-            self._reset()
+            try:
+                await self.stack.aclose()
+            finally:
+                if self.client.gate is not None:
+                    await self.client.gate.client.aclose()
+                    self.client.gate = None
+                self._reset()
+        return response_metadata
 
 
 async def read_packet(stream: asyncio.StreamReader) -> dict | None:
@@ -249,12 +358,14 @@ async def serve_stream() -> None:
                 if operation == "prompt":
                     response = {
                         "ok": True,
-                        "reply": await session.run(request["config"]),
+                        "result": asdict(await session.run(request["config"])),
                     }
                 elif operation == "shutdown":
-                    await session.close()
                     stop = True
-                    response = {"ok": True}
+                    response = {
+                        "ok": True,
+                        "result": {"response_metadata": await session.close()},
+                    }
                 else:
                     raise ValueError(f"unknown ACP session operation: {operation!r}")
             except Exception as error:  # noqa: BLE001 - serialize protocol failures
@@ -263,6 +374,11 @@ async def serve_stream() -> None:
                     "ok": False,
                     "error": f"{type(error).__name__}: {error}",
                 }
+                if isinstance(error, RequestError) and isinstance(error.data, dict):
+                    response["error"] = error.data.get("details") or str(error)
+                    response["error_data"] = error.data
+                if operation == "prompt":
+                    response["result"] = asdict(session.client.turn_result())
             write_packet(sys.stdout.buffer, response)
             if stop:
                 break

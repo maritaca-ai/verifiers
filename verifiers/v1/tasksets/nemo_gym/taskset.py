@@ -1,9 +1,7 @@
 """NeMo Gym resource-server tasks driven by Verifiers harnesses."""
 
 import asyncio
-import importlib.util
 import json
-import sys
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, ClassVar, cast
@@ -109,7 +107,6 @@ class NeMoGymTaskset(Taskset[NeMoGymTask, NeMoGymConfig]):
                 request = dialect.parse_request(row["responses_create_params"])
                 yield NeMoGymTask(
                     NeMoGymData(
-                        idx=idx,
                         name=f"{path.stem}:{idx}",
                         prompt=request.messages,
                         row=row,
@@ -131,19 +128,16 @@ class NeMoGymEnv(SingleAgentEnv):
         config = taskset.config.task
         if config.resources_url is not None:
             return
-        if importlib.util.find_spec("nemo_gym") is None:
-            raise RuntimeError(
-                "Managed NeMo Gym tasksets require the `nemo-gym` extra. "
-                "Install it with: `uv sync --python 3.12 --extra nemo-gym`"
-            )
         entrypoint = taskset.resource_server
         if entrypoint is None:
             raise ValueError("set --env.taskset.task.resources-url")
 
         runtime = self._nemo_runtime = make_runtime(SubprocessConfig())
         await runtime.start()
+        server = Path(__file__).with_name("server.py")
+        program = await runtime.prepare_uv_script(server.read_bytes())
         await runtime.run_background(
-            [sys.executable, "-m", "verifiers.v1.tasksets.nemo_gym.server"],
+            program,
             {"NEMO_GYM_RESOURCE_SERVER": entrypoint},
             "nemo_gym.log",
         )

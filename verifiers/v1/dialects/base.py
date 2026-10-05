@@ -15,13 +15,18 @@ import json
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping
+from glob import has_magic
+from ipaddress import ip_address
 from typing import Any, ClassVar, Generic, TypeVar
-from urllib.parse import urlsplit
 
 from pydantic import AnyHttpUrl, BaseModel, ValidationError
 from pydantic_core import from_json
 
-from verifiers.v1.configs.runtime import NetworkPolicyConfig
+from verifiers.v1.configs.runtime import (
+    NetworkPolicyConfig,
+    intersect_network_hosts,
+    parse_network_rule,
+)
 from verifiers.v1.types import Request, Response, Sampling, SamplingConfig
 
 RespT = TypeVar("RespT", bound=BaseModel)
@@ -31,95 +36,165 @@ logger = logging.getLogger(__name__)
 
 PROVIDER_CAPABILITY_POLICY_CODE = "provider_capability_unavailable"
 CAPABILITY_NOTICE = (
-    "Network protocol blocked fetching a resource. Continue without those capabilities; "
-    "use local tools or inline data already present in the conversation, and do not retry "
-    "the blocked provider-side operation."
+    "Some request content or provider-side capabilities were omitted because they are "
+    "blocked by the network policy or cannot enforce it."
 )
 
 
-def blocked_url(value: str, policy: NetworkPolicyConfig) -> bool:
-    """Whether a provider-resolved resource is neither inline nor policy-permitted."""
-    if value.lower().startswith("data:"):
-        return False
-    try:
-        url = AnyHttpUrl(value)
-    except ValidationError:
-        return True
-    host = url.host.lower().rstrip(".").strip("[]")
-    return not policy.permits(url.scheme, host, url.port)
+class RequestFilter:
+    """One request's omissions and blocked URLs; subclasses define native wire rules."""
+
+    wrappers: tuple[str, ...] = ()
+
+    def __init__(self, policy: NetworkPolicyConfig):
+        self.policy = policy
+        self.blocked_urls: list[str] = []
+        self.capabilities: list[str] = []
+
+    def blocked_url(self, value: object) -> bool:
+        if not isinstance(value, str):
+            return True
+        if value.lower().startswith("data:"):
+            return False
+        try:
+            url = AnyHttpUrl(value)
+        except ValidationError:
+            return True
+        blocked = not self.policy.permits(url.scheme, url.host.strip("[]"), url.port)
+        if blocked:
+            self.blocked_urls.append(value)
+        return blocked
+
+    def blocked(self, value, path: str) -> str | None:
+        """Find the first forbidden part, treating nested content as one unit."""
+        if isinstance(value, list):
+            for index, item in enumerate(value):
+                if blocked := self.blocked(item, f"{path}[{index}]"):
+                    return blocked
+            return None
+        if not isinstance(value, dict):
+            return None
+        caller = value.get("caller")
+        if caller is not None and not (
+            isinstance(caller, dict) and caller.get("type") == "direct"
+        ):
+            return f"{path}.caller.type"
+        return self.blocked_part(value, path)
+
+    def blocked_part(self, value: dict, path: str) -> str | None:
+        raise NotImplementedError
+
+    def mediate(self, value, path: str):
+        """Remove forbidden parts while retaining supported wrapper blocks."""
+        if not isinstance(value, list):
+            if blocked := self.blocked(value, path):
+                self.capabilities.append(blocked)
+                return ""
+            return value
+        mediated = []
+        for index, block in enumerate(value):
+            item_path = f"{path}[{index}]"
+            wrapper = isinstance(block, dict) and block.get("type") in self.wrappers
+            scan = {**block, "content": []} if wrapper else block
+            if blocked := self.blocked(scan, item_path):
+                self.capabilities.append(blocked)
+                continue
+            if wrapper:
+                self.content(block, "content", f"{item_path}.content")
+            mediated.append(block)
+        return mediated
+
+    def content(self, parent: dict, key: str, path: str) -> bool:
+        """Rewrite a content field only when filtering removes something."""
+        before = len(self.capabilities)
+        content = self.mediate(parent.get(key), path)
+        changed = len(self.capabilities) != before
+        if changed:
+            parent[key] = content or ""
+        return changed
+
+    def tools(self, value, path: str = "tools") -> list[dict]:
+        if value is not None and not isinstance(value, list):
+            self.capabilities.append(path)
+            return []
+        tools = []
+        for index, tool in enumerate(value or []):
+            if (filtered := self.tool(tool, f"{path}[{index}]")) is not None:
+                tools.append(filtered)
+        return tools
+
+    def tool(self, value, path: str) -> dict | None:
+        raise NotImplementedError
 
 
-def provider_allowed_domains(
+def provider_domains(
     policy: NetworkPolicyConfig, requested: object = None
 ) -> list[str]:
-    """Translate a network policy to provider domain-filter semantics without widening it."""
-    if policy.block or not policy.allow or "*" in policy.allow:
+    """Translate host rules to the provider's native domain filters.
+
+    Strip leading wildcards and let the provider define domain/subdomain scope.
+    Empty results mean unsupported rules; never send an empty filter.
+    """
+    rules = policy.block or policy.allow
+    if requested is not None and not isinstance(requested, list):
         return []
-    domains = []
-    for rule in policy.allow:
-        try:
-            url = urlsplit(rule if "://" in rule else f"//{rule}")
-            port = url.port
-        except ValueError:
-            return []
-        host = (url.hostname or "").lower().rstrip(".")
-        domain = host.removeprefix("*.")
-        if (
-            url.scheme
-            or port is not None
-            or not host.startswith("*.")
-            or not domain
-            or "*" in domain
-            or not domain.isascii()
-        ):
-            return []
-        domains.append(domain)
-    domains = list(dict.fromkeys(domains))
+    hosts, requested_domains = [], []
+    for entries, output, is_filter in (
+        (rules, hosts, False),
+        (requested or [], requested_domains, True),
+    ):
+        for rule in entries:
+            if not isinstance(rule, str):
+                return []
+            try:
+                url, host, port = parse_network_rule(rule)
+            except ValueError:
+                return []
+            if url.username is not None or url.path or url.query or url.fragment:
+                return []
+            domain = host if is_filter else host.removeprefix("*.")
+            if (
+                url.scheme
+                or port is not None
+                or not domain
+                or has_magic(domain)
+                or not domain.isascii()
+            ):
+                return []
+            try:
+                ip_address(domain)
+            except ValueError:
+                output.append(host)
+            else:
+                return []
+    domains = list(dict.fromkeys(host.removeprefix("*.") for host in hosts))
     if requested is None:
         return domains
-    if not isinstance(requested, list):
-        return []
-    requested_domains = []
-    for domain in requested:
-        if not isinstance(domain, str):
-            return []
-        try:
-            url = urlsplit(domain if "://" in domain else f"//{domain}")
-            port = url.port
-        except ValueError:
-            return []
-        host = (url.hostname or "").lower().rstrip(".")
-        if (
-            url.scheme
-            or port is not None
-            or url.username is not None
-            or url.path
-            or url.query
-            or url.fragment
-            or not host
-            or "*" in host
-            or not host.isascii()
-        ):
-            return []
-        requested_domains.append(host)
+    if policy.block:
+        return list(dict.fromkeys([*domains, *requested_domains]))
     intersection = []
     for allowed in domains:
         for requested_domain in requested_domains:
-            if allowed == requested_domain or allowed.endswith(f".{requested_domain}"):
-                intersection.append(allowed)
-            elif requested_domain.endswith(f".{allowed}"):
-                intersection.append(requested_domain)
+            if host := intersect_network_hosts(f"*.{allowed}", f"*.{requested_domain}"):
+                intersection.append(host.removeprefix("*."))
     return list(dict.fromkeys(intersection))
 
 
 def append_user_notice(
     messages: list,
     *,
+    blocked_urls: list[str],
     text_type: str = "text",
     message_type: str | None = None,
 ) -> None:
-    """Add stable restricted-network context to the earliest user input."""
-    part = {"type": text_type, "text": CAPABILITY_NOTICE}
+    """Explain an actual policy-driven omission in the earliest user input."""
+    notice = CAPABILITY_NOTICE
+    if blocked_urls:
+        notice += "\nBlocked URLs: " + ", ".join(
+            json.dumps(url) for url in dict.fromkeys(blocked_urls)
+        )
+        notice += "\nCircumventing this block is forbidden."
+    part = {"type": text_type, "text": notice}
     for message in messages:
         if not isinstance(message, dict) or message.get("role") != "user":
             continue
@@ -127,9 +202,7 @@ def append_user_notice(
         if isinstance(content, list):
             message["content"] = [*content, part]
         elif isinstance(content, str):
-            message["content"] = (
-                f"{content}\n\n{CAPABILITY_NOTICE}" if content else CAPABILITY_NOTICE
-            )
+            message["content"] = f"{content}\n\n{notice}" if content else notice
         else:
             message["content"] = [part]
         return
@@ -238,13 +311,28 @@ class Dialect(ABC, Generic[RespT]):
         """An error payload in this format's error shape (OpenAI by default)."""
         return {"error": {"message": message, "type": "invalid_request_error"}}
 
+    def stream_keepalive(self, first: bool) -> bytes:
+        """A keepalive for a committed SSE stream whose turn is still being produced (`first`
+        on the stream's first one). A comment line by default: these clients count any bytes
+        as activity. A dialect whose clients only count events sends a no-op event instead."""
+        # Don't terminate an empty event; some SSE clients try to JSON-decode it.
+        return b": keepalive\n"
+
+    def stream_error(self, error: dict) -> bytes:
+        """An `error_body` as an SSE event, for a failure after the stream is committed.
+        OpenAI SDKs raise on any event carrying `error`."""
+        return b"data: " + json.dumps(error).encode() + b"\n\n"
+
     @abstractmethod
     def mediate_external_capabilities(
         self, body: RawRequest, policy: NetworkPolicyConfig
     ) -> tuple[RawRequest, list[str]]:
-        """Remove provider-side capabilities during restricted execution. Implementations add
-        the same policy context on every call because the agent does not retain injected request
-        content. Returned paths never contain request values."""
+        """Filter blocked content and constrain provider tools to the network policy.
+
+        Provider tools execute outside runtime egress controls; remove them when their
+        filters cannot express the policy. Add context only when something is removed.
+        Returned paths never contain request values.
+        """
 
     @abstractmethod
     def parse_request(self, body: RawRequest) -> Request:

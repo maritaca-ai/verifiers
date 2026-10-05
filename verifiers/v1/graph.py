@@ -1,11 +1,14 @@
 """Message-graph trajectory: store each message once, recover branches by walking.
 
 A rollout is a graph of `MessageNode`s — one per distinct message, each linked to its
-predecessor. The conversation is a path from a root to a leaf; branches (compaction,
-subagents) are simply multiple leaves, so branching falls out of the walk. Each node stores
-only the tokens it *adds* to the cumulative sequence, keeping size linear in turns and
-making a branch's training sample a cheap concat of node `token_ids`/`mask`/`logprobs` along
-its path.
+predecessor. A conversation is a path from a root to a leaf; prompt divergence from
+compaction, subagents, or other history rewrites produces multiple leaves, so branching
+falls out of the walk. A branch often corresponds to one harness context window, but it is
+a physical, exact-prefix training view rather than a semantic context identity: a prefix
+break can split one context and prefix reuse can preserve an ancestral path. Each node
+stores only the tokens it *adds* to the cumulative sequence, keeping size linear in turns
+and making a branch's training sample a cheap concat of node
+`token_ids`/`mask`/`logprobs` along its path.
 
 Token attribution (renderer client): the renderer reports, per prompt, each message's token
 span (`RenderedTokens.message_token_spans()`, carried on `TurnTokens.message_spans`). A new
@@ -25,15 +28,23 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field, field_serializer, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    FieldSerializationInfo,
+    field_serializer,
+    field_validator,
+)
 from pydantic.json_schema import SkipJsonSchema
-from renderers.base import MultiModalData, PlaceholderRange, RenderedTokens
+from renderers.base import RenderedTokens
 
+from verifiers.v1.semantic import ParentLink
 from verifiers.v1.types import (
     AssistantMessage,
-    KeptTokens,
     Message,
     Response,
+    SamplingMask,
     TextContentPart,
     Tool,
     ToolMessage,
@@ -61,6 +72,14 @@ def _decode_ndarray(d: dict) -> np.ndarray:
     return np.frombuffer(d["data"], dtype=np.dtype(d["dtype"])).reshape(d["shape"])
 
 
+RECORD_FLOAT_DECIMALS = 4
+"""Default precision of per-token float streams in JSON records (`to_record`). Full-precision
+digits are noise to every record reader and the least compressible bytes of a trace; four
+decimals leave a logprob within 1e-4 of what the trainer saw. `to_record(float_decimals=...)`
+overrides it per dump (`None` keeps every digit). The msgpack wire (`mode="python"`) keeps
+full precision — training never reads the record."""
+
+
 class MessageNode(BaseModel):
     """One message in the graph: a message plus the tokens it adds to the cumulative
     sequence. Concatenating a root→leaf path's nodes reconstructs that branch's full token
@@ -68,6 +87,16 @@ class MessageNode(BaseModel):
 
     parent: int | None = None
     """Index into `Trace.nodes` of the predecessor message; None for a root."""
+    tools: list[Tool] = Field(default_factory=list, exclude_if=lambda tools: not tools)
+    """Tools rendered into this branch's prompt. Populated only on root nodes."""
+    semantic_parents: list[ParentLink] = Field(default_factory=list)
+    """Additional harness-declared parents in the semantic execution graph.
+
+    Unlike ``parent``, these links do not imply an exact token prefix and therefore do
+    not affect physical branch construction. A list permits multiple parents of the same
+    type, supports incremental appends, and preserves their advertised wire order; edge
+    application prevents duplicate ``(node, type)`` links.
+    """
     message: Message
     """The message this node carries (system / user / assistant / tool)."""
     sampled: bool = False
@@ -85,6 +114,10 @@ class MessageNode(BaseModel):
     template scaffold + its own tokens — for an assistant, the generation-prompt scaffold
     followed by the sampled completion. Concatenated along a path, these reproduce the exact
     `prompt_ids + completion_ids` the model saw."""
+    renderer_token_ids: list[int] | None = Field(default=None, exclude=True)
+    """Logical renderer tokens retained only while extending a live rollout.
+    None means they are identical to `token_ids`; an empty list is a real empty slice."""
+
     mask: list[bool] = Field(default_factory=list)
     """Per-token, parallel to `token_ids`: True for trainable, model-sampled tokens (only an
     assistant node's completion span); False for template scaffold and every input-message
@@ -109,72 +142,52 @@ class MessageNode(BaseModel):
     reference_logprobs: list[float] | None = None
     """Reference-model logprobs over the sampled tokens, in the same compact layout as
     `logprobs`. None means no reference model scored this node."""
+    trainer_logprobs: list[float] | None = None
+    """Trainer-recomputed logprobs over the sampled tokens, in the same compact layout as
+    `logprobs`. None means no trainer forward annotated this node."""
+    entropies: list[float] | None = None
+    """Trainer policy entropies over the sampled tokens, in the same compact layout as
+    `logprobs`. None means no trainer forward annotated this node."""
     loss_weights: dict[str, list[float]] | None = None
     """Named loss-weight streams aligned to `token_ids`, consumer-stamped."""
-    multi_modal_data: SkipJsonSchema[MultiModalData | None] = None
-    """The renderer items for the images this message's content introduces (pixel tensors,
-    grids, hashes, placeholders) — the only carrier of the pixels from the env server to the
-    trainer. `Branch.multi_modal_data` concatenates them along the path into the training
-    `mm_kwargs`. Rides the wire as raw bytes (msgpack `bin`) since pydantic can't JSON the numpy;
-    kept off disk by the dump-site `exclude` in prime-rl (the tensors bloat the rollout jsonl)."""
     routed_experts: SkipJsonSchema[np.ndarray | None] = None
     """This node's slice of the MoE expert-routing array — uint8 `[len(token_ids), layers,
     top_k]`, the expert ids inference selected for exactly this node's tokens. Attributed from
     the turn's `generate` payload by `_attribute_routed_experts`; `Branch.routed_experts`
     concatenates these along the path into the trainer's router-replay input. Rides the wire as
     a raw-bytes `__nd__` dict; kept off disk by the dump-site `exclude` in prime-rl."""
-    kept_tokens: SkipJsonSchema[KeptTokens | None] = None
-    """Kept-set sampling masks for this node's sampled tokens, decoded: `ids` flat int32
-    in position order, `counts` the per-token kept-set sizes (aligned with `logprobs`;
-    0 = no mask). Assistant nodes only; consumed via `Branch.kept_tokens` for
-    sampling-replay training. Rides the wire as raw-bytes `__nd__` dicts; kept off disk
-    by the dump-site `exclude` in prime-rl."""
+    sampling_mask: SkipJsonSchema[SamplingMask | None] = None
+    """Sampling masks for this node's sampled tokens.
+
+    `ids` stores the flat token ids and `counts` stores each token's row size. Assistant
+    nodes only. The arrays serialize as raw-byte `__nd__` dictionaries.
+    """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    @field_serializer("multi_modal_data")
-    def serialize_multi_modal_data(self, mmd: MultiModalData | None) -> dict | None:
-        """`MultiModalData` -> msgpack-safe dict so the pixel tensors ride the wire; numpy
-        `mm_items` values become raw-bytes `__nd__` dicts (every renderer emits `return_tensors="np"`)."""
-        if mmd is None:
-            return None
-        return {
-            "mm_hashes": {k: list(v) for k, v in mmd.mm_hashes.items()},
-            "mm_placeholders": {
-                modality: [{"offset": p.offset, "length": p.length} for p in ranges]
-                for modality, ranges in mmd.mm_placeholders.items()
-            },
-            "mm_items": {
-                modality: [
-                    {k: _encode_ndarray(v) for k, v in item.items()} for item in items
-                ]
-                for modality, items in mmd.mm_items.items()
-            },
-        }
-
-    @field_validator("multi_modal_data", mode="before")
-    @classmethod
-    def deserialize_multi_modal_data(cls, value: Any) -> MultiModalData | None:
-        if value is None or isinstance(value, MultiModalData):
-            return value
-        if not isinstance(value, dict):
-            raise TypeError(f"cannot build MultiModalData from {type(value).__name__}")
-        return MultiModalData(
-            mm_hashes={k: list(v) for k, v in (value.get("mm_hashes") or {}).items()},
-            mm_placeholders={
-                modality: [
-                    PlaceholderRange(offset=p["offset"], length=p["length"])
-                    for p in ranges
-                ]
-                for modality, ranges in (value.get("mm_placeholders") or {}).items()
-            },
-            mm_items={
-                modality: [
-                    {k: _decode_ndarray(v) for k, v in item.items()} for item in items
-                ]
-                for modality, items in (value.get("mm_items") or {}).items()
-            },
+    @property
+    def logical_ids(self) -> list[int]:
+        return (
+            self.token_ids
+            if self.renderer_token_ids is None
+            else self.renderer_token_ids
         )
+
+    @field_serializer(
+        "logprobs",
+        "advantages",
+        "reference_logprobs",
+        "trainer_logprobs",
+        "entropies",
+        when_used="json",
+    )
+    def serialize_record_floats(
+        self, values: list[float] | None, info: FieldSerializationInfo
+    ) -> list[float] | None:
+        decimals = (info.context or {}).get("float_decimals", RECORD_FLOAT_DECIMALS)
+        if values is None or decimals is None:
+            return values
+        return [round(value, decimals) for value in values]
 
     @field_serializer("routed_experts")
     def serialize_ndarray_field(self, arr: np.ndarray | None) -> dict | None:
@@ -190,27 +203,26 @@ class MessageNode(BaseModel):
             return _decode_ndarray(value)
         raise TypeError(f"cannot build ndarray field from {type(value).__name__}")
 
-    @field_serializer("kept_tokens")
-    def serialize_kept_tokens(self, kept: KeptTokens | None) -> dict | None:
-        """`KeptTokens` -> dict of raw-bytes `__nd__` entries so the arrays ride the wire."""
-        if kept is None:
+    @field_serializer("sampling_mask")
+    def serialize_sampling_mask(self, mask: SamplingMask | None) -> dict | None:
+        if mask is None:
             return None
         return {
-            "ids": _encode_ndarray(kept.ids),
-            "counts": _encode_ndarray(kept.counts),
+            "ids": _encode_ndarray(mask.ids),
+            "counts": _encode_ndarray(mask.counts),
         }
 
-    @field_validator("kept_tokens", mode="before")
+    @field_validator("sampling_mask", mode="before")
     @classmethod
-    def deserialize_kept_tokens(cls, value: Any) -> KeptTokens | None:
-        if value is None or isinstance(value, KeptTokens):
+    def deserialize_sampling_mask(cls, value: Any) -> SamplingMask | None:
+        if value is None or isinstance(value, SamplingMask):
             return value
         if isinstance(value, dict):
-            return KeptTokens(
+            return SamplingMask(
                 ids=_decode_ndarray(value["ids"]),
                 counts=_decode_ndarray(value["counts"]),
             )
-        raise TypeError(f"cannot build KeptTokens from {type(value).__name__}")
+        raise TypeError(f"cannot build SamplingMask from {type(value).__name__}")
 
 
 def _canonical_tool_arguments(arguments: str) -> str:
@@ -229,9 +241,8 @@ def message_hash(message: Message) -> str:
     """Stable content hash on the fields that round-trip through a prompt — role, content
     (None and "" equal), assistant reasoning content when present, assistant tool calls,
     opaque continuation state, tool call id. Two messages hash equal iff they're the same
-    conversational message, so a re-stated prefix message dedups to one node. The dedup key
-    for sharing a prefix across turns/branches; salt-free so it is identical across processes
-    and after deserialization."""
+    conversational message, so a re-stated prefix message dedups to one node. The message part
+    of the prefix key; salt-free so it is identical across processes and after deserialization."""
     digest = hashlib.blake2b(digest_size=16)
 
     def add(value: str) -> None:
@@ -291,6 +302,7 @@ def message_hash(message: Message) -> str:
             add(tc.type)
             add(tc.id)
             add(tc.name)
+            add(tc.namespace or "")
             add(
                 tc.arguments
                 if tc.type == "custom"
@@ -302,27 +314,158 @@ def message_hash(message: Message) -> str:
     return digest.hexdigest()
 
 
-def _head_index(trace: Trace) -> dict[tuple[int | None, str], int]:
-    """`(parent, msg_hash) -> node_id`, rebuilt lazily from `nodes` after deserialization."""
+def _tools_hash(tools: list[Tool] | None) -> str:
+    payload = [tool.model_dump(mode="json", exclude_none=True) for tool in tools or []]
+    data = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.blake2b(data, digest_size=16).hexdigest()
+
+
+def _node_key(
+    parent: int | None, message: Message, tools: list[Tool] | None = None
+) -> tuple[int | None, str | None, str]:
+    return (
+        parent,
+        _tools_hash(tools) if parent is None else None,
+        message_hash(message),
+    )
+
+
+def _head_index(trace: Trace) -> dict[tuple[int | None, str | None, str], int]:
+    """Physical node key -> id, rebuilt lazily after deserialization."""
     if not trace._head_index and trace.nodes:
         trace._head_index = {
-            (node.parent, message_hash(node.message)): nid
+            _node_key(node.parent, node.message, node.tools): nid
             for nid, node in enumerate(trace.nodes)
         }
     return trace._head_index
+
+
+def message_prefix_len(trace: Trace, prompt: list[Message]) -> int:
+    """Length of the longest message-only graph prefix matching `prompt`."""
+    children: dict[int | None, list[int]] = {}
+    for node_id, node in enumerate(trace.nodes):
+        children.setdefault(node.parent, []).append(node_id)
+
+    parents: list[int | None] = [None]
+    matched = 0
+    for message in prompt:
+        key = message_hash(message)
+        parents = [
+            node_id
+            for parent in parents
+            for node_id in children.get(parent, [])
+            if message_hash(trace.nodes[node_id].message) == key
+        ]
+        if not parents:
+            break
+        matched += 1
+    return matched
+
+
+def _matching_node(
+    trace: Trace,
+    parent: int | None,
+    message: Message,
+    token_ids: list[int] | None = None,
+    renderer_token_ids: list[int] | None = None,
+    tools: list[Tool] | None = None,
+) -> int | None:
+    """Find an existing child, optionally requiring its exact token spans.
+
+    The head index deliberately points at only the latest content-equivalent child. Token-level
+    prefix breaks can leave older physical variants under the same key, so a token mismatch falls
+    back to a reverse scan rather than materializing a duplicate of an already-existing variant.
+    """
+    key = _node_key(parent, message, tools)
+    indexed = _head_index(trace).get(key)
+    if (
+        indexed is not None
+        and (token_ids is None or trace.nodes[indexed].token_ids == token_ids)
+        and (
+            renderer_token_ids is None
+            or trace.nodes[indexed].logical_ids == renderer_token_ids
+        )
+    ):
+        return indexed
+    if token_ids is None and renderer_token_ids is None:
+        return indexed
+    for node_id in range(len(trace.nodes) - 1, -1, -1):
+        if node_id == indexed:
+            continue
+        node = trace.nodes[node_id]
+        if (
+            (token_ids is None or node.token_ids == token_ids)
+            and (renderer_token_ids is None or node.logical_ids == renderer_token_ids)
+            and _node_key(node.parent, node.message, node.tools) == key
+        ):
+            return node_id
+    return None
+
+
+def _matching_prefix_node(
+    trace: Trace,
+    parent: int | None,
+    message: Message,
+    prompt_ids: list[int],
+    start: int,
+    stop: int,
+    renderer_prompt_ids: list[int],
+    renderer_start: int,
+    renderer_stop: int,
+    tools: list[Tool] | None = None,
+) -> int | None:
+    """Find the longest content-equivalent child matching inside `[start, stop]`.
+
+    Renderers may leave a prompt-supplied assistant unattributed (`message_spans[i] is None`).
+    Its existing sampled node still owns physical tokens, so use those tokens to recover the
+    otherwise-missing message boundary. The next attributed message's start bounds the match:
+    a sampled variant must never consume tokens that the renderer assigned to that message.
+    """
+    key = _node_key(parent, message, tools)
+    indexed = _head_index(trace).get(key)
+    candidates: list[int] = []
+    if indexed is not None:
+        candidates.append(indexed)
+    candidates.extend(
+        node_id
+        for node_id in range(len(trace.nodes) - 1, -1, -1)
+        if node_id != indexed
+        and _node_key(
+            trace.nodes[node_id].parent,
+            trace.nodes[node_id].message,
+            trace.nodes[node_id].tools,
+        )
+        == key
+    )
+    matches = [
+        node_id
+        for node_id in candidates
+        if start + len(trace.nodes[node_id].token_ids) <= stop
+        and prompt_ids[start : start + len(trace.nodes[node_id].token_ids)]
+        == trace.nodes[node_id].token_ids
+        and renderer_start + len(trace.nodes[node_id].logical_ids) <= renderer_stop
+        and renderer_prompt_ids[
+            renderer_start : renderer_start + len(trace.nodes[node_id].logical_ids)
+        ]
+        == trace.nodes[node_id].logical_ids
+    ]
+    return max(
+        matches, key=lambda node_id: len(trace.nodes[node_id].token_ids), default=None
+    )
 
 
 @dataclass(frozen=True)
 class PendingTurn:
     """A resolved prompt waiting on model inference.
 
-    `prepare_turn` does the one canonical graph prefix walk. Training clients use the resolved
-    prefix for renderer bridging before inference, and `commit` uses the same prefix after
-    inference to add only the prompt tail plus the sampled assistant response.
+    `prepare_turn` resolves the graph prefix used for renderer bridging before inference. `commit`
+    preserves that inference-producing prefix, extends it with any matching nodes committed while
+    inference was in flight, then adds only the remaining prompt tail and sampled response.
     """
 
     trace: Trace
     prompt: list[Message]
+    tools: list[Tool]
     prefix_node_ids: list[int]
     path_len: int
 
@@ -334,34 +477,31 @@ class PendingTurn:
     def tail(self) -> list[Message]:
         return self.prompt[self.tail_start :]
 
-    def previous_token_ids(self) -> tuple[list[int], list[int]] | None:
-        """Return `(previous_prompt_ids, previous_completion_ids)` for a bridge anchor.
+    def previous_renderer_token_ids(self) -> tuple[list[int], list[int]] | None:
+        """Return the logical renderer prompt and completion for a bridge anchor.
 
         The anchor must end at a sampled assistant node. That node stores generation-prompt
-        scaffold followed by sampled completion tokens, so split at the first sampled token.
+        scaffold followed by sampled completion tokens, so split off the sampled suffix.
         """
         if not self.prefix_node_ids:
             return None
         last = self.trace.nodes[self.prefix_node_ids[-1]]
         if not last.sampled:
             return None
-        first_sampled = next(
-            (i for i, sampled in enumerate(last.mask) if sampled), None
-        )
-        if first_sampled is None:
-            return None
-        if any(not sampled for sampled in last.mask[first_sampled:]):
+        num_sampled = sum(last.mask)
+        if not num_sampled:
             return None
 
-        prompt_ids: list[int] = []
+        renderer_prompt_ids: list[int] = []
         for nid in self.prefix_node_ids[:-1]:
-            prompt_ids.extend(self.trace.nodes[nid].token_ids)
-        prompt_ids.extend(last.token_ids[:first_sampled])
-        # Slicing already returns an independent list; avoid a second completion-sized copy.
-        completion_ids = last.token_ids[first_sampled:]
-        if not prompt_ids or not completion_ids:
+            node = self.trace.nodes[nid]
+            renderer_prompt_ids.extend(node.logical_ids)
+        last_ids = last.logical_ids
+        renderer_prompt_ids.extend(last_ids[:-num_sampled])
+        completion_ids = last_ids[-num_sampled:]
+        if not renderer_prompt_ids or not completion_ids:
             return None
-        return prompt_ids, completion_ids
+        return renderer_prompt_ids, completion_ids
 
     def prompt_message_spans(
         self, tail_attribution: RenderedTokens
@@ -369,38 +509,78 @@ class PendingTurn:
         """Convert bridge-tail attribution into full-prompt message spans."""
         # Reused bridge tokens are unattributed, so scan only the newly rendered tail.
         tail_spans = RenderedTokens(
-            message_indices=tail_attribution.message_indices[self.path_len :],
+            message_indices=tail_attribution.message_indices[self.renderer_path_len :],
             message_roles=tail_attribution.message_roles,
         ).message_token_spans()
         # Tail spans are slice-relative; restore their full-prompt token offsets.
         return [None] * self.tail_start + [
-            None if span is None else (span[0] + self.path_len, span[1] + self.path_len)
+            None
+            if span is None
+            else (span[0] + self.renderer_path_len, span[1] + self.renderer_path_len)
             for span in tail_spans
         ]
 
-    def commit(self, response: Response, tools: list[Tool] | None = None) -> int:
+    @property
+    def renderer_path_len(self) -> int:
+        return sum(
+            len(self.trace.nodes[nid].logical_ids) for nid in self.prefix_node_ids
+        )
+
+    def commit(self, response: Response) -> int:
         """Add this turn to the graph; returns the committed assistant node's id."""
         assistant_id = _commit_turn(self, response)
-        if tools:
-            self.trace.tools = tools
+        if self.tools:
+            self.trace.tools = list(
+                {
+                    (tool.namespace, tool.name, tool.type): tool
+                    for tool in [*self.trace.tools, *self.tools]
+                }.values()
+            )
+        self.trace.clear_preview(self)
         return assistant_id
 
-    def commit_prompt(self, tools: list[Tool] | None = None) -> None:
+    def abandon(self) -> None:
+        """The request failed or was cancelled before a commit: its preview goes."""
+        self.trace.clear_preview(self)
+
+    def commit_prompt(self) -> None:
         """Record an input that terminated before model inference."""
         parent = self.prefix_node_ids[-1] if self.prefix_node_ids else None
         index = _head_index(self.trace)
         for message in self.tail:
+            existing = _matching_node(self.trace, parent, message, tools=self.tools)
+            if existing is not None:
+                parent = existing
+                continue
             previous = parent
-            self.trace.nodes.append(MessageNode(parent=parent, message=message))
+            self.trace.nodes.append(
+                MessageNode(
+                    parent=parent,
+                    message=message,
+                    tools=self.tools if parent is None else [],
+                )
+            )
             parent = len(self.trace.nodes) - 1
-            index[(previous, message_hash(message))] = parent
-        if tools:
-            self.trace.tools = tools
+            index[_node_key(previous, message, self.tools)] = parent
+        if self.tools:
+            self.trace.tools = list(
+                {
+                    (tool.namespace, tool.name, tool.type): tool
+                    for tool in [*self.trace.tools, *self.tools]
+                }.values()
+            )
+        self.trace.clear_preview(self)
 
 
-def prepare_turn(trace: Trace, prompt: list[Message]) -> PendingTurn:
-    """Resolve `prompt` against the trace graph without mutating it."""
+def prepare_turn(
+    trace: Trace,
+    prompt: list[Message],
+    tools: list[Tool] | None = None,
+) -> PendingTurn:
+    """Resolve a physical message-and-tools prefix without mutating the trace."""
     idx = _head_index(trace)
+    tools = list(tools or [])
+    tools_hash = _tools_hash(tools)
     parent: int | None = None
     path_len = 0
     prefix_node_ids: list[int] = []
@@ -413,15 +593,19 @@ def prepare_turn(trace: Trace, prompt: list[Message]) -> PendingTurn:
         ):
             children = [
                 node_id
-                for (node_parent, _), node_id in idx.items()
+                for (node_parent, node_tools_hash, _), node_id in idx.items()
                 if node_parent == parent
+                and (parent is not None or node_tools_hash == tools_hash)
             ]
             # Repeated image URLs are cheaper to compare than to encode and hash again.
             # Only scan short, unambiguous parents; all other cases use the stable index.
             if len(children) == 1 and trace.nodes[children[0]].message == msg:
                 existing = children[0]
         if existing is None:
-            existing = idx.get((parent, message_hash(msg)))
+            message_key = message_hash(msg)
+            existing = idx.get(
+                (parent, tools_hash if parent is None else None, message_key)
+            )
         if existing is None:
             break
         prefix_node_ids.append(existing)
@@ -430,60 +614,47 @@ def prepare_turn(trace: Trace, prompt: list[Message]) -> PendingTurn:
     return PendingTurn(
         trace=trace,
         prompt=prompt,
+        tools=tools,
         prefix_node_ids=prefix_node_ids,
         path_len=path_len,
     )
 
 
-def _part_modality(part) -> str | None:
-    """The multimodal modality a content part introduces (currently only images), or None."""
-    return "image" if getattr(part, "type", None) == "image_url" else None
-
-
-def _attribute_mm(
-    trace: Trace,
-    path: list[tuple[int, Message]],
-    num_reused: int,
-    mmd: MultiModalData | None,
+def _replace_placeholder_routing_row(
+    trace: Trace, prefix_node_ids: list[int], arr: np.ndarray, off: int
 ) -> None:
-    """Attach each new image's renderer item to the node whose message introduced it. The
-    renderer emits items per modality in prompt order (message order, then content-part order),
-    so we walk the path advancing a per-modality cursor over every message's media but write
-    only the nodes created this turn — `path[:num_reused]` is the reused prefix, already
-    attributed when first created. Item order is all training needs; placeholder offsets aren't
-    carried."""
-    if mmd is None or mmd.is_empty():
+    """Replace the prefix's placeholder routing row with the one this turn's prefill forwarded."""
+    if not 1 <= off <= arr.shape[0]:
         return
-    cursors: dict[str, int] = {}
-    for pos, (node_id, msg) in enumerate(path):
-        content = msg.content
-        if not isinstance(content, list):
-            continue
-        node_items: dict[str, list] = {}
-        node_hashes: dict[str, list] = {}
-        for part in content:
-            modality = _part_modality(part)
-            if modality is None:
-                continue
-            k = cursors.get(modality, 0)
-            cursors[modality] = k + 1
-            # Reused prefix: advance the cursor over its media, don't re-attribute.
-            if pos < num_reused:
-                continue
-            items = mmd.mm_items.get(modality) or []
-            hashes = mmd.mm_hashes.get(modality) or []
-            if k < len(items):
-                node_items.setdefault(modality, []).append(items[k])
-            if k < len(hashes):
-                node_hashes.setdefault(modality, []).append(hashes[k])
-        if node_items:
-            trace.nodes[node_id].multi_modal_data = MultiModalData(
-                mm_items=node_items, mm_hashes=node_hashes
-            )
+    # Only assistant (`sampled`) nodes are affected: the model forward isn't run on  the final
+    # generated token for such turns, meaning its routing decisions are fundamentally unavailable.
+    # But, because routing needs one row per token, that row instead receives an inaccurate
+    # placeholder, attempt to fix up below.
+    node_with_placeholder = None
+    for nid in reversed(prefix_node_ids):
+        if trace.nodes[nid].token_ids:
+            node_with_placeholder = trace.nodes[nid]
+            break
+    if node_with_placeholder is None or not node_with_placeholder.sampled:
+        return
+    node_rows = node_with_placeholder.routed_experts
+    if (
+        node_rows is None
+        or node_rows.shape[0] == 0
+        or node_rows.shape[1:] != arr.shape[1:]
+    ):
+        return
+    # Row `i` of this turn's array is sequence position `start + i`, so the prefix's final position
+    # is `arr[off - 1]`. Concatenating widens the node when this turn serialized `uint16`, where an
+    # in-place write would truncate.
+    node_with_placeholder.routed_experts = np.concatenate(
+        [node_rows[:-1], arr[off - 1 : off]], axis=0
+    )
 
 
 def _attribute_routed_experts(
     trace: Trace,
+    prefix_node_ids: list[int],
     new_node_ids: list[int],
     path_len: int,
     payload: Any,
@@ -492,7 +663,8 @@ def _attribute_routed_experts(
     payload's array covers the turn's prompt+completion from `payload["start"]` (0 = from token
     0); the nodes created this turn tile sequence positions `[path_len:]` in creation order, so
     we hand each node `arr[off : off+len(node.token_ids)]` and advance. Reused-prefix nodes keep
-    the routing attributed when they were first created. A node whose slice falls outside the
+    the routing attributed when they were first created, except for the one position this turn
+    corrects (see `_replace_placeholder_routing_row`). A node whose slice falls outside the
     array (a `start` past `path_len`, e.g. an unexpected prefix-cache delta) is left unset — the
     branch then reports no routing rather than misaligning."""
     if payload is None:
@@ -502,6 +674,7 @@ def _attribute_routed_experts(
         payload["shape"]
     )
     off = path_len - int(payload.get("start", 0) or 0)
+    _replace_placeholder_routing_row(trace, prefix_node_ids, arr, off)
     needed = off + sum(len(trace.nodes[nid].token_ids) for nid in new_node_ids)
     for nid in new_node_ids:
         n = len(trace.nodes[nid].token_ids)
@@ -510,94 +683,244 @@ def _attribute_routed_experts(
             # Own only this node's rows; a view would retain the turn's full-context array.
             trace.nodes[nid].routed_experts = arr[off:end].copy()
         elif n and arr.shape[0] and 0 <= off and end == needed == arr.shape[0] + 1:
-            # The engine omits the turn's final position because no forward pass follows it.
-            # Pad only the final node's suffix instead of copying the full-context array.
+            # No forward pass follows the turn's final position, so it gets a placeholder: a
+            # copy of the previous row, appended to this node's slice of the array.
             trace.nodes[nid].routed_experts = np.concatenate(
                 [arr[off:], arr[-1:]], axis=0
             )
         off = end
 
 
-def _attribute_kept_tokens(
-    trace: Trace, assistant_id: int, payload: KeptTokens | None
+def _attribute_sampling_mask(
+    trace: Trace, assistant_id: int, payload: SamplingMask | None
 ) -> None:
-    """Attach this turn's kept-set sampling masks to the assistant node (the payload
-    covers exactly the turn's completion tokens, so no path arithmetic). A payload
-    that doesn't line up with the node's sampled tokens is dropped, not misaligned."""
+    """Attach a completion-aligned sampling mask to the assistant node."""
     if payload is None:
         return
-    counts = np.frombuffer(binascii.a2b_base64(payload.counts), dtype=np.int32)
-    ids = np.frombuffer(binascii.a2b_base64(payload.ids), dtype=np.int32)
     node = trace.nodes[assistant_id]
-    if len(counts) != sum(node.mask) or int(counts.sum()) != len(ids):
+    if len(payload.counts) != sum(node.mask) or int(payload.counts.sum()) != len(
+        payload.ids
+    ):
         return
-    # Own the buffers — the payload views reference the turn's response bytes.
-    node.kept_tokens = KeptTokens(ids=ids.copy(), counts=counts.copy())
+    node.sampling_mask = payload
+
+
+def _project_prompt_attribution(
+    renderer_prompt_ids: list[int],
+    prompt_ids: list[int],
+    mm_token_type_id_map: dict[int, int],
+    mm_placeholders: list[tuple[int, int]] | None,
+    message_spans: list[tuple[int, int] | None] | None,
+    is_content: list[bool] | None,
+) -> tuple[list[tuple[int, int] | None] | None, list[bool] | None]:
+    """Project logical attribution using vLLM's multimodal placeholder ranges."""
+    if renderer_prompt_ids == prompt_ids:
+        return message_spans, is_content
+    if not mm_token_type_id_map or mm_placeholders is None:
+        raise ValueError(
+            "cannot align renderer and vLLM prompt tokens without multimodal placeholders"
+        )
+
+    offsets = [0]
+    prompt_offset = 0
+    placeholder_index = 0
+    for token_id in renderer_prompt_ids:
+        if token_id in mm_token_type_id_map:
+            if placeholder_index >= len(mm_placeholders):
+                raise ValueError(
+                    "vLLM multimodal placeholders do not align with renderer prompt"
+                )
+            offset, length = mm_placeholders[placeholder_index]
+            if offset != prompt_offset or length < 1:
+                raise ValueError(
+                    "vLLM multimodal placeholders do not align with renderer prompt"
+                )
+            prompt_offset += length
+            placeholder_index += 1
+        else:
+            if (
+                prompt_offset >= len(prompt_ids)
+                or prompt_ids[prompt_offset] != token_id
+            ):
+                raise ValueError(
+                    "renderer prompt does not align with vLLM prompt tokens"
+                )
+            prompt_offset += 1
+        offsets.append(prompt_offset)
+    if prompt_offset != len(prompt_ids) or placeholder_index != len(mm_placeholders):
+        raise ValueError("renderer prompt does not align with vLLM prompt tokens")
+
+    projected_spans = None
+    if message_spans is not None:
+        projected_spans = []
+        for span in message_spans:
+            if span is None:
+                projected_spans.append(None)
+                continue
+            start, end = span
+            if not 0 <= start <= end <= len(renderer_prompt_ids):
+                raise ValueError("message span exceeds renderer prompt tokens")
+            projected_spans.append((offsets[start], offsets[end]))
+
+    projected_is_content = is_content
+    if is_content:
+        if len(is_content) != len(renderer_prompt_ids):
+            raise ValueError(
+                "content attribution does not match renderer prompt tokens"
+            )
+        projected_is_content = []
+        for index, value in enumerate(is_content):
+            projected_is_content.extend([value] * (offsets[index + 1] - offsets[index]))
+    return projected_spans, projected_is_content
 
 
 def _commit_turn(turn: PendingTurn, response: Response) -> int:
     trace = turn.trace
     prompt = turn.prompt
     tokens = response.tokens
-    multi_modal_data = tokens.multi_modal_data if tokens else None
     # Constant per renderer, so re-stamping every turn is idempotent.
     if tokens is not None and tokens.mm_token_type_id_map:
         trace.mm_token_type_id_map = tokens.mm_token_type_id_map
     prompt_ids = tokens.prompt_ids if tokens else []
-    spans = tokens.message_spans if tokens else None
-    is_content = tokens.is_content if tokens else None
-    has_is_content = is_content is not None and len(is_content) == len(prompt_ids)
+    renderer_prompt_ids = (
+        tokens.renderer_prompt_ids
+        if tokens and tokens.renderer_prompt_ids is not None
+        else prompt_ids
+    )
+    renderer_spans = tokens.message_spans if tokens else None
+    renderer_is_content = tokens.is_content if tokens else None
     idx = _head_index(trace)
 
-    # Token-based prefix reuse. `prepare_turn` matched the prefix by message hash (content); when
-    # this turn carries token ids, tighten that to token identity — the stored prefix must be an
-    # exact token prefix of what the model saw this turn (`prompt_ids`). Reuse whole nodes within
-    # the longest common token prefix and fork at the first divergence, so a retokenized prior
-    # (BPE drift, dropped `<think>`, rewritten tool calls) branches off with this turn's real
-    # tokens instead of silently inheriting stale ones. Comparing the *concatenated* prefix (not
-    # per-message spans) is what makes this correct: a prior assistant's stored generation form
-    # and its re-rendered input form place the turn-close scaffold in different nodes but at the
-    # same position, so only a genuine content/token change shifts the common prefix. The bridge
-    # keeps the prior verbatim so it matches fully (stays linear); the eval relay carries no token
-    # ids and keeps the message-hash prefix.
     prefix = turn.prefix_node_ids
-    path_len = turn.path_len  # cumulative stored token length of the reused prefix
+    path_len = turn.path_len
+    renderer_path_len = turn.renderer_path_len
     if tokens is not None and prefix:
-        # Compare node by node against the prompt_ids slice at the running offset (C-level list
-        # ==, short-circuits at the first divergent node) — no full concatenation materialized.
         keep = 0
         off = 0
+        renderer_off = 0
         for nid in prefix:
-            node_tokens = trace.nodes[nid].token_ids
-            if prompt_ids[off : off + len(node_tokens)] != node_tokens:
+            node = trace.nodes[nid]
+            node_renderer_ids = node.logical_ids
+            if (
+                prompt_ids[off : off + len(node.token_ids)] != node.token_ids
+                or renderer_prompt_ids[
+                    renderer_off : renderer_off + len(node_renderer_ids)
+                ]
+                != node_renderer_ids
+            ):
                 break
-            off += len(node_tokens)
+            off += len(node.token_ids)
+            renderer_off += len(node_renderer_ids)
             keep += 1
+        if tokens.bridged and keep != len(prefix):
+            raise ValueError(
+                "vLLM prompt tokens do not exactly extend the stored rollout prefix"
+            )
         prefix = prefix[:keep]
         path_len = off
+        renderer_path_len = renderer_off
+    spans, is_content = _project_prompt_attribution(
+        renderer_prompt_ids,
+        prompt_ids,
+        trace.mm_token_type_id_map,
+        tokens.mm_placeholders if tokens else None,
+        renderer_spans,
+        renderer_is_content,
+    )
+    has_is_content = is_content is not None and len(is_content) == len(prompt_ids)
+
+    # A parallel request may have committed more of this prompt after `prepare_turn` resolved
+    # the inference prefix. Reconcile that still-uncommitted tail now, one whole message at a
+    # time. Exact token-span equality preserves intentional renderer-level forks; tokenless relay
+    # turns use message identity. Because commit is synchronous, once this loop stops the rest of
+    # the tail can be appended without another request interleaving.
+    prefix = list(prefix)
+    while len(prefix) < len(prompt):
+        i = len(prefix)
+        span = spans[i] if spans and i < len(spans) else None
+        end = span[1] if span else path_len
+        renderer_span = (
+            renderer_spans[i] if renderer_spans and i < len(renderer_spans) else None
+        )
+        renderer_end = renderer_span[1] if renderer_span else renderer_path_len
+        parent = prefix[-1] if prefix else None
+        if tokens is not None and span is None:
+            next_start = next(
+                (
+                    later_span[0]
+                    for later_span in (spans[i + 1 :] if spans else [])
+                    if later_span is not None
+                ),
+                len(prompt_ids),
+            )
+            next_renderer_start = next(
+                (
+                    later_span[0]
+                    for later_span in (
+                        renderer_spans[i + 1 :] if renderer_spans else []
+                    )
+                    if later_span is not None
+                ),
+                len(renderer_prompt_ids),
+            )
+            existing = _matching_prefix_node(
+                trace,
+                parent,
+                prompt[i],
+                prompt_ids,
+                path_len,
+                next_start,
+                renderer_prompt_ids,
+                renderer_path_len,
+                next_renderer_start,
+                tools=turn.tools,
+            )
+            if existing is not None:
+                end += len(trace.nodes[existing].token_ids)
+                renderer_end += len(trace.nodes[existing].logical_ids)
+        else:
+            node_tokens = prompt_ids[path_len:end]
+            renderer_node_tokens = renderer_prompt_ids[renderer_path_len:renderer_end]
+            existing = _matching_node(
+                trace,
+                parent,
+                prompt[i],
+                node_tokens if tokens is not None else None,
+                renderer_node_tokens if tokens is not None else None,
+                tools=turn.tools,
+            )
+        if existing is None:
+            break
+        prefix.append(existing)
+        path_len = end
+        renderer_path_len = renderer_end
+
     num_reused = len(prefix)
     parent = prefix[-1] if prefix else None
-    # cursor: in prompt_ids, the end of the previous *new* message's tokens
     cursor: int | None = None
-    # Track new nodes separately so routed-expert attribution does not need this full path.
+    renderer_cursor: int | None = None
+    # Track new nodes separately so routed-expert attribution needs only node ids, not this path.
     new_node_ids: list[int] = []
-    # Materialize the reused message path only for multimodal cursor attribution.
-    mm_path: list[tuple[int, Message]] | None = None
-    if multi_modal_data is not None:
-        mm_path = [(nid, prompt[i]) for i, nid in enumerate(prefix)]
     for i, msg in enumerate(prompt[num_reused:], start=num_reused):
-        key = (parent, message_hash(msg))
+        key = _node_key(parent, msg, turn.tools)
         start = path_len if cursor is None else cursor
         span = spans[i] if spans and i < len(spans) else None
         end = span[1] if span else start
         node_tokens = prompt_ids[start:end]
+        renderer_start = (
+            renderer_path_len if renderer_cursor is None else renderer_cursor
+        )
+        renderer_span = (
+            renderer_spans[i] if renderer_spans and i < len(renderer_spans) else None
+        )
+        renderer_end = renderer_span[1] if renderer_span else renderer_start
         trace.nodes.append(
-            # Every value is already typed framework data; avoid revalidating and copying
-            # potentially huge token slices a second time.
             MessageNode.model_construct(
                 parent=parent,
+                tools=turn.tools if parent is None else [],
                 message=msg,
                 token_ids=node_tokens,
+                renderer_token_ids=renderer_prompt_ids[renderer_start:renderer_end],
                 mask=[False] * len(node_tokens),
                 is_content=is_content[start:end] if has_is_content else [],
             )
@@ -605,20 +928,24 @@ def _commit_turn(turn: PendingTurn, response: Response) -> int:
         parent = len(trace.nodes) - 1
         idx[key] = parent
         new_node_ids.append(parent)
-        if mm_path is not None:
-            mm_path.append((parent, msg))
         cursor = end
+        renderer_cursor = renderer_end
 
-    # Assistant node: trailing scaffold (the generation prompt) + the sampled completion.
     comp_ids = tokens.completion_ids if tokens else []
     gen_start = path_len if cursor is None else cursor
     gen_prompt = prompt_ids[gen_start:]
+    renderer_gen_start = (
+        renderer_path_len if renderer_cursor is None else renderer_cursor
+    )
+    renderer_gen_prompt = renderer_prompt_ids[renderer_gen_start:]
     trace.nodes.append(
         MessageNode.model_construct(
             parent=parent,
+            tools=turn.tools if parent is None else [],
             message=response.message,
             sampled=True,
             token_ids=[*gen_prompt, *comp_ids],
+            renderer_token_ids=[*renderer_gen_prompt, *comp_ids],
             mask=[False] * len(gen_prompt) + [True] * len(comp_ids),
             is_content=([False] * len(gen_prompt) + [True] * len(comp_ids))
             if has_is_content
@@ -627,24 +954,21 @@ def _commit_turn(turn: PendingTurn, response: Response) -> int:
             logprobs=tokens.completion_logprobs if tokens else [],
         )
     )
-    # Register the assistant so the next turn's prompt (which restates it) reuses this node.
     assistant_id = len(trace.nodes) - 1
-    idx[(parent, message_hash(response.message))] = assistant_id
+    idx[_node_key(parent, response.message, turn.tools)] = assistant_id
     new_node_ids.append(assistant_id)
-
-    # Attribute this turn's images onto the input nodes that introduced them (by content part).
-    if mm_path is not None:
-        _attribute_mm(trace, mm_path, num_reused, multi_modal_data)
 
     # Attribute this turn's expert-routing array onto the nodes created this turn (new input
     # nodes in creation order, then the assistant node), each getting the routing for its tokens.
+    # The prefix goes in too, so the position the previous turn could only pad can be corrected.
     _attribute_routed_experts(
-        trace, new_node_ids, path_len, tokens.routed_experts if tokens else None
+        trace, prefix, new_node_ids, path_len, tokens.routed_experts if tokens else None
     )
 
-    # Attribute this turn's kept-set sampling masks onto the assistant node (they are
-    # completion-aligned, so only the sampled node carries them).
-    _attribute_kept_tokens(trace, assistant_id, tokens.kept_tokens if tokens else None)
+    # Sampling masks are completion-aligned, so only the sampled node carries them.
+    _attribute_sampling_mask(
+        trace, assistant_id, tokens.sampling_mask if tokens else None
+    )
 
     return assistant_id
 
@@ -657,3 +981,14 @@ def leaves(trace: Trace) -> list[int]:
     `Trace.branches` view walks each leaf's parents back to its root to build the branch."""
     has_child = {n.parent for n in trace.nodes if n.parent is not None}
     return [i for i in range(len(trace.nodes)) if i not in has_child]
+
+
+def path(trace: Trace, node: int) -> list[Message]:
+    """The conversation ending at `node`: its root-to-node messages."""
+    messages: list[Message] = []
+    current: int | None = node
+    while current is not None:
+        messages.append(trace.nodes[current].message)
+        current = trace.nodes[current].parent
+    messages.reverse()
+    return messages

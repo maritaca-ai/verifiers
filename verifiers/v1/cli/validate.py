@@ -4,9 +4,11 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import shutil
 import sys
 import time
+import uuid
 from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -28,6 +30,7 @@ from verifiers.v1.cli.resolve import (
 )
 from verifiers.v1.cli.resume import distribute
 from verifiers.v1.configs.cli.validate import ValidateConfig
+from verifiers.v1.errors import TaskError, boundary
 from verifiers.v1.runtimes import make_runtime
 from verifiers.v1.state import state_cls
 from verifiers.v1.task import Task
@@ -43,16 +46,19 @@ logger = logging.getLogger(__name__)
 RESULTS_FILE = "results.jsonl"
 SUMMARY_FILE = "summary.json"
 LOG_FILE = "logs/validate.log"
-FINAL_REASONS = frozenset({"valid", "invalid"})
-REASONS = ("valid", "invalid", "error", "timeout")
+FINAL_VALUES = {"valid": True, "invalid": False, "unchecked": None}
+REASONS = ("valid", "invalid", "unchecked", "error", "timeout")
+SOLVED = 1.0
+"""An untouched task whose reward reaches this already passes: its noop check is
+invalid. Lower (partial) rewards are recorded but pass the check."""
 
 ResultRow = dict[str, Any]
 
 USAGE = (
-    "usage: uv run validate [<taskset-id>] [--only-setup | --only-gold] "
+    "usage: uv run vf-validate [<taskset-id>] [--only-setup | --only-gold | --only-noop] "
     "[-o <output-dir>] [--runtime.type subprocess] [options] [@ file.toml]\n"
-    "       uv run validate @ <run-dir>/configs/validate.json --resume   (re-run missing/errored/timed-out tasks)\n"
-    "       runs persisted gold and setup-only checks per task (no model)"
+    "       uv run vf-validate @ <run-dir>/configs/validate.json --resume   (re-run missing/errored/timed-out tasks)\n"
+    "       runs persisted gold and noop (untouched scoring) checks per task (no agent)"
 )
 
 
@@ -68,6 +74,8 @@ def validation_mode(config: ValidateConfig) -> str:
         return "gold"
     if config.only_setup:
         return "setup"
+    if config.only_noop:
+        return "noop"
     return "all"
 
 
@@ -96,11 +104,14 @@ def _is_final(row: object, key: str, mode: str) -> bool:
     if not isinstance(row, dict):
         return False
     reason = row.get("reason")
+    # A noop check records its untouched scoring; a row without it never scored.
+    noop = row.get("noop") if mode == "all" else row
     return (
         row.get("task_key") == key
         and row.get("mode") == mode
-        and reason in FINAL_REASONS
-        and row.get("valid") is (reason == "valid")
+        and reason in FINAL_VALUES
+        and row.get("valid") is FINAL_VALUES[reason]
+        and (mode in ("gold", "setup") or isinstance(noop, dict) and "rewards" in noop)
     )
 
 
@@ -157,7 +168,9 @@ def summarize(rows: Sequence[ResultRow], total: int, mode: str) -> dict[str, Any
     missing = max(0, total - len(rows))
     outcomes = {reason: counts[reason] for reason in REASONS}
     outcomes["missing"] = missing
-    terminal = outcomes["valid"] + outcomes["invalid"]
+    checked = outcomes["valid"] + outcomes["invalid"]
+    rate_total = total - outcomes["unchecked"]
+    terminal = checked + outcomes["unchecked"]
     summary: dict[str, Any] = {
         "mode": mode,
         "total": total,
@@ -165,11 +178,11 @@ def summarize(rows: Sequence[ResultRow], total: int, mode: str) -> dict[str, Any
         "terminal": terminal,
         "owed": missing + outcomes["error"] + outcomes["timeout"],
         "outcomes": outcomes,
-        "valid_rate": round(outcomes["valid"] / total, 6) if total else None,
+        "valid_rate": round(outcomes["valid"] / rate_total, 6) if checked else None,
     }
     if mode == "all":
         checks: dict[str, dict[str, int]] = {}
-        for check in ("gold", "setup"):
+        for check in ("gold", "noop"):
             check_counts = Counter(
                 row.get(check, {}).get("reason")
                 for row in rows
@@ -194,29 +207,61 @@ def save_run(config: ValidateConfig, results_dir: Path, total: int) -> None:
     write_summary(results_dir, summarize([], total, validation_mode(config)))
 
 
-def _classify(valid: bool, exc: BaseException | None) -> str:
-    if valid:
+def _classify(valid: bool | None, exc: BaseException | None) -> str:
+    if valid is True:
         return "valid"
     if isinstance(exc, asyncio.TimeoutError):
         return "timeout"
     if exc is not None:
         return "error"
+    if valid is None:
+        return "unchecked"
     return "invalid"
 
 
 def _row(
-    task, mode: str, valid: bool, exc: BaseException | None, start: float
+    task, mode: str, valid: bool | None, exc: BaseException | None, start: float
 ) -> ResultRow:
     return {
         "index": task.data.idx,
         "name": task.data.name,
         "mode": mode,
-        "valid": bool(valid),
+        "valid": valid,
         "reason": _classify(valid, exc),
         "elapsed": round(time.time() - start, 2),
         "error": str(exc) if exc is not None else None,
         "error_type": type(exc).__name__ if exc is not None else None,
     }
+
+
+async def _setup_only(task: Task, trace: Trace, runtime) -> bool:
+    """Setup completing is the whole check."""
+    return True
+
+
+async def _gold(task: Task, trace: Trace, runtime) -> bool | None:
+    """Apply and check the reference answer."""
+    return await task.validate(runtime)
+
+
+async def _score_untouched(task: Task, trace: Trace, runtime) -> bool | None:
+    """Finalize and score the freshly set-up task exactly as a rollout would, with no
+    agent turn in between. Valid iff it does not already pass; `None` when the task
+    declares no reward to check."""
+    async with (
+        asyncio.timeout(task.data.timeout.finalize),
+        boundary(TaskError, "task finalize"),
+    ):
+        await invoke(task.finalize, {"trace": trace, "runtime": runtime})
+    async with asyncio.timeout(task.data.timeout.scoring):
+        await task.score(trace, runtime)
+    if not trace.rewards:
+        return None
+    return trace.reward < SOLVED
+
+
+CHECKS = {"setup": _setup_only, "gold": _gold, "noop": _score_untouched}
+"""What each check runs after `Task.setup`, in the check's own fresh runtime."""
 
 
 async def _run_check(task: Task, config: ValidateConfig, mode: str) -> ResultRow:
@@ -230,7 +275,9 @@ async def _run_check(task: Task, config: ValidateConfig, mode: str) -> ResultRow
         if config.timeout.setup is not None
         else task.data.timeout.setup
     )
-    valid, exc = False, None
+    valid: bool | None = False
+    exc = None
+    trace: Trace | None = None
     try:
         runtime.env = dict(task.runtime_env())
         trace = Trace(
@@ -250,10 +297,8 @@ async def _run_check(task: Task, config: ValidateConfig, mode: str) -> ResultRow
             invoke(task.setup, {"trace": trace, "runtime": runtime}),
             setup_timeout,
         )
-        valid = (
-            await asyncio.wait_for(task.validate(runtime), config.timeout.total)
-            if mode == "gold"
-            else True
+        valid = await asyncio.wait_for(
+            CHECKS[mode](task, trace, runtime), config.timeout.total
         )
     except Exception as e:  # noqa: BLE001 - validation reports plugin failures per task
         exc = e
@@ -264,7 +309,21 @@ async def _run_check(task: Task, config: ValidateConfig, mode: str) -> ResultRow
             logger.warning(
                 "runtime teardown failed (task %s)", task.data.idx, exc_info=True
             )
-    return _row(task, mode, valid, exc, start)
+    row = _row(task, mode, valid, exc, start)
+    if mode == "noop":
+        rewards = trace.rewards if trace is not None else {}
+        row["reward"] = trace.reward if exc is None and rewards else None
+        row["rewards"] = {
+            name: reward.score if reward is not None else None
+            for name, reward in rewards.items()
+        }
+    return row
+
+
+def _describe(row: ResultRow) -> str | None:
+    if row["mode"] == "noop" and row["reason"] == "invalid":
+        return f"passes untouched (reward={row['reward']:g})"
+    return row["error"]
 
 
 def _all_reason(rows: list[ResultRow]) -> str:
@@ -275,12 +334,14 @@ def _all_reason(rows: list[ResultRow]) -> str:
         return "error"
     if "timeout" in reasons:
         return "timeout"
-    return "invalid"
+    if "invalid" in reasons:
+        return "invalid"
+    return "unchecked"
 
 
 def _all_error(rows: list[ResultRow]) -> tuple[str | None, str | None]:
-    failed = [row for row in rows if not row["valid"]]
-    parts = [f"{row['mode']}: {row['error'] or row['reason']}" for row in failed]
+    failed = [row for row in rows if row["reason"] not in ("valid", "unchecked")]
+    parts = [f"{row['mode']}: {_describe(row) or row['reason']}" for row in failed]
     error_types = {str(row["error_type"]) for row in failed if row["error_type"]}
     return ("; ".join(parts) or None, "+".join(sorted(error_types)) or None)
 
@@ -288,20 +349,21 @@ def _all_error(rows: list[ResultRow]) -> tuple[str | None, str | None]:
 async def _run_all(task: Task, config: ValidateConfig) -> ResultRow:
     start = time.time()
     gold = await _run_check(task, config, "gold")
-    setup = await _run_check(task, config, "setup")
-    rows = [gold, setup]
+    noop = await _run_check(task, config, "noop")
+    rows = [gold, noop]
+    reason = _all_reason(rows)
     error, error_type = _all_error(rows)
     return {
         "index": task.data.idx,
         "name": task.data.name,
         "mode": "all",
-        "valid": all(row["valid"] for row in rows),
-        "reason": _all_reason(rows),
+        "valid": None if reason == "unchecked" else reason == "valid",
+        "reason": reason,
         "elapsed": round(time.time() - start, 2),
         "error": error,
         "error_type": error_type,
         "gold": gold,
-        "setup": setup,
+        "noop": noop,
     }
 
 
@@ -315,15 +377,12 @@ async def _validate_task(task: Task, config: ValidateConfig) -> ResultRow:
 
 
 async def run_validate(config: ValidateConfig) -> list[dict]:
-    taskset = vf.load_taskset(config.taskset)
-    if config.num_tasks is None and taskset.INFINITE:
+    taskset = vf.load_taskset(config.taskset).select(config.select)
+    if not taskset.bounded:
         raise ValueError(
             f"{type(taskset).__name__} is infinite - bound the run with -n"
         )
-    selected = taskset.shuffle() if config.shuffle else taskset
-    if config.num_tasks is not None:
-        selected = selected.head(config.num_tasks)
-    tasks = list(selected)
+    tasks = list(taskset)
     if isinstance(config.runtime, vf.SubprocessConfig) and any(
         type(t).NEEDS_CONTAINER or t.data.image for t in tasks
     ):
@@ -331,7 +390,7 @@ async def run_validate(config: ValidateConfig) -> list[dict]:
             "taskset needs a container runtime to validate - pass --runtime.type docker (or prime)"
         )
     mode = validation_mode(config)
-    checks = "gold+setup" if mode == "all" else mode
+    checks = "gold+noop" if mode == "all" else mode
     out = output_path(config)
     selected_keys = [task.hash for task in tasks]
     if not config.resume:
@@ -388,7 +447,7 @@ async def run_validate(config: ValidateConfig) -> list[dict]:
         await run_shielded(persist())
         st.end, st.state = time.time(), row["reason"]
         if not config.rich:  # the dashboard shows this live; otherwise log each task
-            detail = f" - {row['error']}" if row["error"] else ""
+            detail = f" - {note}" if (note := _describe(row)) else ""
             logger.info(
                 "idx=%s valid=%s reason=%s (%.1fs)%s",
                 row["index"],
@@ -406,9 +465,7 @@ async def run_validate(config: ValidateConfig) -> list[dict]:
     )
     async with display:
         if not plan:
-            logger.info(
-                "nothing to resume: all %d task(s) are valid or invalid", len(tasks)
-            )
+            logger.info("nothing to resume: all %d task(s) are terminal", len(tasks))
             return rows
         await asyncio.gather(
             *(_one(position, task, key) for position, task, key in plan)
@@ -419,6 +476,8 @@ async def run_validate(config: ValidateConfig) -> list[dict]:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # The run identity: every process this run spawns inherits it.
+    os.environ.setdefault("VF_RUN_ID", uuid.uuid4().hex)
     argv = with_positional_taskset(
         list(sys.argv[1:]) if argv is None else list(argv), flag="--taskset.id"
     )

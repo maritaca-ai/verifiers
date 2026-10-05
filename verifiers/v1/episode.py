@@ -3,9 +3,10 @@
 import uuid
 from typing import Annotated, Any, Generic, Literal, Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, computed_field, model_validator
 
 from verifiers.v1.configs.agent import WireAgentConfig
+from verifiers.v1.graph import RECORD_FLOAT_DECIMALS
 from verifiers.v1.state import State, StateT
 from verifiers.v1.task import DataT, WireTaskData
 from verifiers.v1.trace import EXCLUDE_FIELDS, AgentConfigT, Error, Trace, TraceTask
@@ -98,6 +99,9 @@ class Episode(BaseModel, Generic[DataT, StateT, AgentConfigT]):
     """The run this episode belongs to, consumer-stamped."""
     ok: bool = False
     """Whether the episode completed successfully."""
+    is_timeout: bool = False
+    """Whether the env's own `run()`/`finalize()` deadline expired; a per-agent
+    stage deadline flags its trace (`Trace.is_timeout`)."""
     errors: list[Error] = Field(default_factory=list)
     """Every error captured across attempts, oldest to newest."""
     traces: list[Trace[DataT, StateT, AgentConfigT]] = Field(default_factory=list)
@@ -118,16 +122,19 @@ class Episode(BaseModel, Generic[DataT, StateT, AgentConfigT]):
         judge/off-graph usage stays on the traces (`Trace.extra_usage`)."""
         return Usage.aggregate(u for t in self.traces if (u := t.usage) is not None)
 
+    @computed_field
     @property
     def num_input_tokens(self) -> int:
         """Fed-in tokens (system + user + tool), summed across traces."""
         return sum(t.num_input_tokens for t in self.traces)
 
+    @computed_field
     @property
     def num_output_tokens(self) -> int:
         """Model-generated tokens across all turns, summed across traces."""
         return sum(t.num_output_tokens for t in self.traces)
 
+    @computed_field
     @property
     def num_total_tokens(self) -> int:
         """Final sequence lengths per branch, summed across traces."""
@@ -146,12 +153,16 @@ class Episode(BaseModel, Generic[DataT, StateT, AgentConfigT]):
             grouped.setdefault(trace.agent.name, []).append(trace)
         return grouped
 
-    def to_record(self) -> dict[str, Any]:
-        """JSON record without raw trace tensors, which remain on the msgpack wire."""
+    def to_record(
+        self, float_decimals: int | None = RECORD_FLOAT_DECIMALS
+    ) -> dict[str, Any]:
+        """JSON record without raw trace tensors, which remain on the msgpack wire.
+        Per-token float streams are rounded to `float_decimals` (`None` keeps every digit)."""
         return self.model_dump(
             mode="json",
             exclude={"traces": {"__all__": EXCLUDE_FIELDS}},
             exclude_none=True,
+            context={"float_decimals": float_decimals},
         )
 
 

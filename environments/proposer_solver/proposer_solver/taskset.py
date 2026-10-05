@@ -12,7 +12,7 @@ a `solve_rate` metric.
 Seats are deliberately heterogeneous: point the proposer at a code-running harness
 in a real sandbox and keep the solvers on a cheap tool-less chat loop —
 
-    uv run eval proposer-solver -n 4 \
+    uv run vf-eval proposer-solver -n 4 \
       --env.proposer.harness.id codex --env.proposer.runtime.type prime \
       --env.solver.harness.id null
 
@@ -182,12 +182,11 @@ class ProposerSolverTaskset(vf.Taskset[ProposeTask, vf.TasksetConfig]):
         return [
             ProposeTask(
                 SeedData(
-                    idx=i,
                     name=topic.replace(" ", "-"),
                     prompt=PROPOSE.format(topic=topic),
                     topic=topic,
                 ),
                 self.config.task,
             )
-            for i, topic in enumerate(self.TOPICS)
+            for topic in self.TOPICS
         ]

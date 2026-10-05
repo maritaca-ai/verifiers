@@ -1,15 +1,15 @@
 """Run Kimi Code's native ACP server against interception."""
 
 import logging
-import shlex
+import tomllib
 from typing import Literal
 
 import tomli_w
-from pydantic import Field
 
 from verifiers.v1.acp import ACPConfig, ACPHarness
 from verifiers.v1.clients import ModelContext
-from verifiers.v1.configs.harness import HarnessConfig
+from verifiers.v1.configs.harness import HarnessConfig, PinnedVersion
+from verifiers.v1.harnesses.utils.install import ensure_installed, remove_dir
 from verifiers.v1.runtimes import Runtime
 from verifiers.v1.task import TaskData
 from verifiers.v1.trace import Trace
@@ -19,7 +19,6 @@ logger = logging.getLogger(__name__)
 BINARY = "/tmp/vf-kimi-code/bin/kimi"
 KIMI_HOME = ".vf-kimi-code"
 ACP_COMMAND = [BINARY, "acp"]
-SKILLS_DIR = f"{KIMI_HOME}/skills"
 
 INSTALL = r"""
 set -e
@@ -39,7 +38,7 @@ env \
 
 
 class KimiCodeHarnessConfig(HarnessConfig):
-    version: str = Field(default="0.36.0", pattern=r"^[A-Za-z0-9._+-]+$")
+    version: PinnedVersion = "2.0.2"
     """Kimi Code release to install, pinned for reproducibility."""
     transport: Literal["chat_completions", "responses", "anthropic_messages"] = (
         "chat_completions"
@@ -51,23 +50,20 @@ class KimiCodeHarness(ACPHarness[KimiCodeHarnessConfig]):
     APPENDS_SYSTEM_PROMPT = True
     SUPPORTS_MCP = True
     SUPPORTS_SKILLS = True
+    SUPPORTS_TOOL_INTERCEPTION = True
 
     async def setup(self, runtime: Runtime) -> None:
-        await self.install_skills(runtime, SKILLS_DIR)
         logger.info(
             "kimi-code: ensuring Kimi Code %s is installed", self.config.version
         )
         script = INSTALL.replace("{version}", self.config.version)
-        guarded = (
-            "mkdir -p /tmp/vf-kimi-code && "
-            '"$(command -v flock || command -v lockf)" '
-            f"/tmp/vf-kimi-code/install.lock sh -c {shlex.quote(script)}"
+        await ensure_installed(
+            runtime,
+            directory="/tmp/vf-kimi-code",
+            install=script,
+            env={},
+            label="Kimi Code",
         )
-        install = await runtime.run(["sh", "-c", guarded], {})
-        if install.exit_code != 0:
-            raise RuntimeError(
-                f"Kimi Code install failed: {install.stderr.strip()[-500:]}"
-            )
         await super().setup(runtime)
 
     async def prepare_acp(
@@ -81,6 +77,8 @@ class KimiCodeHarness(ACPHarness[KimiCodeHarnessConfig]):
         data: TaskData,
     ) -> ACPConfig:
         kimi_home = f"{KIMI_HOME}/{trace.id}"
+        skills_dir = f"{kimi_home}/skills"
+        await self.install_skills(runtime, skills_dir)
         provider_type = {
             "chat_completions": "openai",
             "responses": "openai_responses",
@@ -92,7 +90,7 @@ class KimiCodeHarness(ACPHarness[KimiCodeHarnessConfig]):
             else endpoint
         )
         config = {
-            "extra_skill_dirs": [SKILLS_DIR] if self.config.skills else [],
+            "extra_skill_dirs": [skills_dir] if self.config.skills else [],
             **(
                 {
                     "permission": {
@@ -129,3 +127,18 @@ class KimiCodeHarness(ACPHarness[KimiCodeHarnessConfig]):
             prompt=prompt,
             system_prompt=system_prompt,
         )
+
+    async def cleanup(self, trace: Trace, runtime: Runtime) -> None:
+        await remove_dir(runtime, f"{KIMI_HOME}/{trace.id}", "Kimi Code state")
+
+    async def gate_tools(
+        self, config: ACPConfig, runtime: Runtime, url: str, secret: str
+    ) -> None:
+        # An `ask` rule for every tool routes each call through Kimi's approval bridge,
+        # which its ACP server turns into a permission request for the runner.
+        path = f"{config.env['KIMI_CODE_HOME']}/config.toml"
+        settings = tomllib.loads((await runtime.read(path)).decode())
+        settings.setdefault("permission", {}).setdefault("rules", []).append(
+            {"decision": "ask", "scope": "user", "pattern": "*"}
+        )
+        await runtime.write(path, tomli_w.dumps(settings).encode())

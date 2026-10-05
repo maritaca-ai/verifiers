@@ -185,69 +185,81 @@ class EnvServerPool:
             while True:
                 events = dict(await self._poller.poll())
                 if self.frontend in events:
-                    (
-                        client_id,
-                        request_id,
-                        method,
-                        payload,
-                    ) = await self.frontend.recv_multipart()
-                    if method == b"health":
-                        await self.frontend.send_multipart(
-                            [client_id, request_id, _HEALTH]
+                    frames = await self.frontend.recv_multipart()
+                    # Drop malformed requests without skipping ready worker replies.
+                    if len(frames) != 4:
+                        logger.warning(
+                            "frontend: dropping malformed request (%d frames, expected 4)",
+                            len(frames),
                         )
-                    elif method == b"cancel":
-                        # Route the cancel to the worker holding the target run;
-                        # an unknown/finished target (or an unparseable payload
-                        # — one bad frame must not tear down the broker) is
-                        # answered inline
-                        try:
-                            body = msgpack.unpackb(payload, raw=False)
-                            target = str(body.get("request_id", "")).encode()
-                        except Exception:  # noqa: BLE001 - one bad frame must not kill the broker
-                            target = b""
-                        target_entry = pending.get(target)
-                        if target_entry is None:
+                    else:
+                        client_id, request_id, method, payload = frames
+                        if method == b"health":
                             await self.frontend.send_multipart(
-                                [client_id, request_id, _CANCEL_MISS]
+                                [client_id, request_id, b"reply", _HEALTH]
                             )
+                        elif method == b"cancel":
+                            # Route the cancel to the worker holding the target run;
+                            # an unknown/finished target (or an unparseable payload
+                            # — one bad frame must not tear down the broker) is
+                            # answered inline
+                            try:
+                                body = msgpack.unpackb(payload, raw=False)
+                                target = str(body.get("request_id", "")).encode()
+                            except Exception:  # noqa: BLE001 - one bad frame must not kill the broker
+                                target = b""
+                            target_entry = pending.get(target)
+                            if target_entry is None:
+                                await self.frontend.send_multipart(
+                                    [client_id, request_id, b"reply", _CANCEL_MISS]
+                                )
+                            else:
+                                worker = target_entry["worker"]
+                                worker["active"] += 1
+                                pending[request_id] = {
+                                    "client_id": client_id,
+                                    "worker": worker,
+                                }
+                                in_flight += 1
+                                await worker["dealer"].send_multipart(
+                                    [request_id, method, payload]
+                                )
                         else:
-                            worker = target_entry["worker"]
+                            worker = min(self.workers, key=lambda w: w["active"])
                             worker["active"] += 1
                             pending[request_id] = {
                                 "client_id": client_id,
                                 "worker": worker,
                             }
                             in_flight += 1
+                            # forward without client_id — the DEALER identity is the worker's
+                            # `client_id`; we hold the real one in `pending`.
                             await worker["dealer"].send_multipart(
                                 [request_id, method, payload]
                             )
-                    else:
-                        worker = min(self.workers, key=lambda w: w["active"])
-                        worker["active"] += 1
-                        pending[request_id] = {
-                            "client_id": client_id,
-                            "worker": worker,
-                        }
-                        in_flight += 1
-                        # forward without client_id — the DEALER identity is the worker's
-                        # `client_id`; we hold the real one in `pending`.
-                        await worker["dealer"].send_multipart(
-                            [request_id, method, payload]
-                        )
-                        if self.elastic:
-                            self._maybe_scale_up(in_flight)
+                            if self.elastic:
+                                self._maybe_scale_up(in_flight)
                 for w in self.workers:
                     if w["dealer"] in events:
-                        request_id, data = await w["dealer"].recv_multipart(copy=False)
-                        # Copy only the routing key; relay the response Frames unchanged.
-                        entry = pending.pop(request_id.bytes, None)
-                        if entry is None:
-                            continue
-                        entry["worker"]["active"] -= 1
-                        in_flight -= 1
+                        request_id, kind, data = await w["dealer"].recv_multipart(
+                            copy=False
+                        )
+                        # Copy only the routing key; relay the Frames unchanged. A
+                        # `delta` is one of many for its request — only the `reply`
+                        # closes the request out.
+                        if kind.bytes == b"reply":
+                            entry = pending.pop(request_id.bytes, None)
+                            if entry is None:
+                                continue
+                            entry["worker"]["active"] -= 1
+                            in_flight -= 1
+                        else:
+                            entry = pending.get(request_id.bytes)
+                            if entry is None:
+                                continue
                         with contextlib.suppress(zmq.ZMQError):
                             await self.frontend.send_multipart(
-                                [entry["client_id"], request_id, data], copy=False
+                                [entry["client_id"], request_id, kind, data], copy=False
                             )
         except (asyncio.CancelledError, KeyboardInterrupt):
             pass

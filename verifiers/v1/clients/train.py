@@ -10,23 +10,22 @@ from dataclasses import dataclass, field
 from typing import Any, ClassVar, TypeVar
 
 from openai import OpenAIError
-from renderers import OverlongPromptError as RendererOverlongPromptError
-from renderers import RenderedTokens, Renderer, RendererConfig
+from renderers import OverlongPromptError, RenderedTokens, Renderer, RendererConfig
 from renderers.base import ToolCallParseStatus, is_multimodal
 
 from verifiers.v1.clients.base import build_async_openai
 from verifiers.v1.clients.client import SESSION_ID_HEADER, Client
 from verifiers.v1.configs.client import TrainClientConfig
-from verifiers.v1.dialects import FINISH_REASONS, ChatDialect, Dialect, parse_tools
+from verifiers.v1.dialects import FINISH_REASONS, ChatDialect, Dialect
 from verifiers.v1.dialects.chat import message_to_wire
-from verifiers.v1.errors import OverlongPromptError, model_error
+from verifiers.v1.errors import ProviderError, model_error
 from verifiers.v1.graph import PendingTurn
 from verifiers.v1.types import (
     AssistantMessage,
     FinishReason,
-    KeptTokens,
     Response,
     SamplingConfig,
+    SamplingMask,
     Tool,
     ToolCall,
     TurnTokens,
@@ -39,6 +38,10 @@ T = TypeVar("T")
 
 
 def tool_to_wire(tool: Tool) -> dict:
+    if tool.type != "function" or tool.namespace:
+        raise NotImplementedError(
+            "The renderer client only supports unnamespaced function tools."
+        )
     function: dict = {
         "name": tool.name,
         "description": tool.description,
@@ -62,6 +65,7 @@ def serialize_completion(response: Response, model: str) -> dict:
                 "type": c.type,
                 c.type: {
                     "name": c.name,
+                    **({"namespace": c.namespace} if c.namespace else {}),
                     "input" if c.type == "custom" else "arguments": c.arguments,
                 },
             }
@@ -136,6 +140,16 @@ def response_from_generate(
         message_spans = bridged_turn.prompt_message_spans(attribution)
     else:
         message_spans = attribution.message_token_spans()
+    raw_mm_placeholders = result.get("mm_placeholders")
+    mm_placeholders = (
+        sorted(
+            (placeholder["offset"], placeholder["length"])
+            for ranges in raw_mm_placeholders.values()
+            for placeholder in ranges
+        )
+        if raw_mm_placeholders is not None
+        else None
+    )
     return Response(
         id=result.get("request_id", ""),
         created=0,
@@ -155,15 +169,17 @@ def response_from_generate(
         # million-token contexts synchronously on the event loop.
         tokens=TurnTokens.model_construct(
             prompt_ids=prompt_ids,
+            renderer_prompt_ids=result.get("renderer_prompt_ids"),
+            bridged=bridged_turn is not None,
             completion_ids=completion_ids,
             completion_logprobs=result.get("completion_logprobs") or [],
             message_spans=message_spans,
             is_content=attribution.is_content if attribution is not None else None,
-            multi_modal_data=result.get("multi_modal_data"),
+            mm_placeholders=mm_placeholders,
             mm_token_type_id_map=mm_token_type_id_map,
             routed_experts=result.get("routed_experts"),
-            kept_tokens=KeptTokens(**kept)
-            if (kept := result.get("kept_tokens"))
+            sampling_mask=SamplingMask.from_sampling_mask(mask)
+            if (mask := result.get("sampling_mask"))
             else None,
         ),
     )
@@ -344,10 +360,9 @@ class TrainClient(Client):
                 f"{type(dialect).__name__}. Use the proxy client for this dialect, or add "
                 f"renderer support for it."
             )
-        # Intercepted turns already own the typed prompt, so only their tools need parsing here.
         if turn is not None:
             prompt = turn.prompt
-            tools = parse_tools(body.get("tools"))
+            tools = turn.tools
         else:
             request = dialect.parse_request(body)
             prompt = request.messages
@@ -355,15 +370,14 @@ class TrainClient(Client):
         from renderers.client import generate
 
         wire_tools = [tool_to_wire(t) for t in tools] if tools else None
-        wire_messages = (
-            [message_to_wire(m) for m in turn.tail] if turn is not None else []
-        )
+        wire_messages = [message_to_wire(m) for m in prompt]
+        wire_tail = [message_to_wire(m) for m in turn.tail] if turn is not None else []
         prompt_ids: list[int] | None = None
-        multi_modal_data = None
         prompt_attribution: RenderedTokens | None = None
         model = body["model"]
         sampling_params = sampling.wire_args()
         chat_template_kwargs = sampling_params.pop("chat_template_kwargs", None)
+        cache_salt = sampling_params.pop("cache_salt", None)
         pool = ElasticRendererPool(
             self.config.renderer_model_name or model,
             self.config.renderer,
@@ -377,14 +391,18 @@ class TrainClient(Client):
             mm_token_type_id_map = (
                 renderer.mm_token_type_id_map if is_multimodal(renderer) else None
             )
-            # Only build the (O(context)) previous-turn token ids once the cheap guards pass — a
-            # multimodal prompt or a tail that isn't a clean `[tool*, user?]` extension can't bridge.
-            can_bridge = (
-                turn is not None
-                and not _has_multimodal_content(prompt)
-                and _is_valid_incremental_tail(wire_messages)
-            )
-            previous_ids = turn.previous_token_ids() if can_bridge else None
+            has_images = _has_multimodal_content(prompt)
+            process_multimodal = not has_images
+            if has_images and not getattr(
+                renderer, "supports_process_multimodal", False
+            ):
+                raise NotImplementedError(
+                    f"{type(renderer).__name__} does not support process_multimodal=False"
+                )
+            render_kwargs = {} if process_multimodal else {"process_multimodal": False}
+            # Only build the O(context) previous token stream for a bridgeable tail.
+            can_bridge = turn is not None and _is_valid_incremental_tail(wire_tail)
+            previous_ids = turn.previous_renderer_token_ids() if can_bridge else None
             if previous_ids is not None:
                 previous_prompt_ids, previous_completion_ids = previous_ids
 
@@ -392,33 +410,33 @@ class TrainClient(Client):
                     return renderer.bridge_to_next_turn(
                         previous_prompt_ids,
                         previous_completion_ids,
-                        wire_messages,
+                        wire_tail,
                         tools=wire_tools,
+                        **render_kwargs,
                     )
 
                 bridged = await slot.run(bridge)
                 if bridged is not None:
                     prompt_ids = bridged.token_ids
-                    multi_modal_data = bridged.multi_modal_data
                     prompt_attribution = bridged
                     bridged_turn = turn
                     sampling_params["routed_experts_prompt_start"] = max(
-                        len(previous_prompt_ids) + len(previous_completion_ids) - 1,
-                        0,
+                        turn.path_len - 1, 0
                     )
 
             # Render here (encode-side, so through the slot) rather than inside `generate`:
             # handed prebuilt prompt_ids, generate's own renderer touches are decode-side
             # and stop-id reads, safe on a bare renderer without lock or thread hop.
             if prompt_ids is None:
-                wire_messages = [message_to_wire(m) for m in prompt]
                 rendered = await slot.run(
                     lambda: renderer.render(
-                        wire_messages, tools=wire_tools, add_generation_prompt=True
+                        wire_messages,
+                        tools=wire_tools,
+                        add_generation_prompt=True,
+                        **render_kwargs,
                     )
                 )
                 prompt_ids = rendered.token_ids
-                multi_modal_data = rendered.multi_modal_data
                 prompt_attribution = rendered
 
             try:
@@ -428,16 +446,19 @@ class TrainClient(Client):
                     messages=wire_messages,
                     model=model,
                     prompt_ids=prompt_ids,
-                    multi_modal_data=multi_modal_data,
                     prompt_attribution=prompt_attribution,
                     tools=wire_tools,
                     sampling_params=sampling_params,
+                    process_multimodal=process_multimodal,
+                    cache_salt=cache_salt,
                     extra_headers={SESSION_ID_HEADER: session_id}
                     if session_id
                     else None,
                 )
-            except RendererOverlongPromptError as e:
-                raise OverlongPromptError(str(e)) from e
+            except OverlongPromptError as e:
+                # The renderer's pre-flight overflow never reached the provider: a
+                # deterministic 400, so the harness SDK never retries it.
+                raise ProviderError(str(e), status_code=400) from e
             except OpenAIError as e:
                 raise model_error(e) from e
         response = response_from_generate(

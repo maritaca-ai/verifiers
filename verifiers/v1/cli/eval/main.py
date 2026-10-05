@@ -10,7 +10,6 @@ from pydantic_config import cli
 
 from verifiers.v1.cli.eval.runner import run_eval
 from verifiers.v1.cli.output import (
-    TRACES_FILE,
     create_attempt_log_dir,
     output_path,
     saved_config_path,
@@ -26,12 +25,13 @@ from verifiers.v1.cli.resolve import (
 from verifiers.v1.configs.cli.eval import EvalConfig
 from verifiers.v1.utils.interrupt import install_interrupt
 from verifiers.v1.utils.logging import setup_logging
+from verifiers.v1.utils.trace_store import TRACES_FILE
 
 logger = logging.getLogger(__name__)
 
 USAGE = (
-    "usage: uv run eval [<taskset-id>] [--env.id <id>] [options] [@ file.toml]\n"
-    "       uv run eval @ <run-dir>/configs/resolved/eval.json --resume   (re-run the run's missing/errored rollouts)"
+    "usage: uv run vf-eval [<taskset-id>] [--env.id <id>] [options] [@ file.toml]\n"
+    "       uv run vf-eval @ <run-dir>/configs/resolved/eval.json --resume   (re-run the run's missing/errored rollouts)"
 )
 
 
@@ -46,11 +46,9 @@ def main(argv: list[str] | None = None) -> None:
                 narrow_config(EvalConfig, argv)
             )  # full option help, narrowed to the given ids
         return
-    # An env-block flag (or a since-moved flat axis) skips the usage gate so the
-    # typed parse renders its did-you-mean instead of a bare usage line.
-    typed_axis = any(
-        a.startswith(("--env.", "--taskset.", "--harness.", "--serve.")) for a in argv
-    )
+    # An env-block flag skips the usage gate so the typed parse renders its
+    # did-you-mean instead of a bare usage line.
+    typed_axis = any(a.startswith("--env.") for a in argv)
     if (
         not extract_id(argv, "env.taskset")
         and not references_config_file(argv)
@@ -110,7 +108,7 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(
                 f"--resume requires the exact config the run was started with - it "
                 f"differs in [{', '.join(changed)}]. Resumed rollouts would not be "
-                f"comparable; re-run with `uv run eval @ {saved_path} --resume`, or "
+                f"comparable; re-run with `uv run vf-eval @ {saved_path} --resume`, or "
                 "start a fresh run"
             )
     if config.dry_run:  # resolved + validated; write it to the output dir and exit
@@ -118,8 +116,7 @@ def main(argv: list[str] | None = None) -> None:
         logger.info("wrote config to %s", write_config(config, run_path))
         return
     # Always tee this attempt's logs to `logs/attempt_<n>/eval.log` (`logs/latest`
-    # points there) — in server mode (the default) the workers write there too, and
-    # `--rich.show-logs` tails it live.
+    # points there); `--rich.show-logs` tails it live.
     log_file = str(create_attempt_log_dir(run_path) / "eval.log")
     level = "DEBUG" if config.verbose else "INFO"
     setup_logging(level, log_file=log_file, console=config.rich is None)
@@ -130,16 +127,11 @@ def main(argv: list[str] | None = None) -> None:
     install_interrupt()
 
     try:
-        # Through the env-server worker pool by default; in-process with --no-serve.
         episodes = asyncio.run(run_eval(config))
     except KeyboardInterrupt:
         # Graceful cleanup has already run (each rollout's `finally`); partial results are on
         # disk. Exit on the conventional Ctrl-C code without a traceback.
         raise SystemExit(130)
-    if config.push and config.rich is None:
-        from verifiers.v1.utils.platform import push_traces
-
-        push_traces(episodes, config)
     if (
         config.rich is None
     ):  # --rich is the whole output; otherwise dump each trace as JSON

@@ -4,65 +4,88 @@ grading for tasks that declare ``[verifier].environment_mode = "separate"``.
 The default env for harbor runs (the taskset package exports it). A shared-verifier
 task runs exactly as under the single-agent env: one `agent` trace, graded in the
 box it worked in. A separate-verifier task is graded by `finalize` instead: the
-solver's declared artifacts travel (collected by its task `finalize` while its box
-is alive), a fresh box is provisioned from the task's verifier declaration,
+solver's declared artifacts travel (collected after its task `finalize` while its
+box is alive), a fresh box is provisioned from the task's verifier declaration,
 `tests/` is staged there, and the verifier's rewards land on the solver's trace.
-No second agent is involved — the verifier is the task's own `tests/test.sh`.
+No second agent is involved — the verifier is the task's own `tests/test.sh`,
+staged by the task's own class, so taskset subclasses customize grading through
+their task hooks rather than a custom env.
 """
 
 import asyncio
-import logging
-from contextlib import AsyncExitStack
-
-from pydantic import Field
+from pathlib import Path
 
 import verifiers.v1 as vf
-from verifiers.v1.runtimes import RuntimeConfig, provision_runtime
+from verifiers.v1.agent import resolve_rollout_timeouts
+from verifiers.v1.envs.isolated_verifier import (
+    IsolatedVerifierEnv,
+    IsolatedVerifierEnvConfig,
+)
+from verifiers.v1.errors import TaskError, boundary
+from verifiers.v1.runtimes import Runtime, RuntimeConfig
+from verifiers.v1.tasksets.harbor.compose import compose_services
 from verifiers.v1.tasksets.harbor.taskset import (
     HarborTask,
     verifier_box_data,
 )
-from verifiers.v1.utils.artifacts import restore
 from verifiers.v1.utils.compile import resolve_runtime_config
-from verifiers.v1.utils.retries import backoff
-
-logger = logging.getLogger(__name__)
 
 
-class HarborEnvConfig(vf.EnvConfig):
-    agent: vf.AgentConfig = vf.AgentConfig()
-    """The one seat — the policy under evaluation/training; pin
-    `--env.agent.harness.*` to choose its program or runtime."""
-    verifier_runtime: RuntimeConfig | None = None
-    """Where a separate-verifier task grades. None derives the grading box from
-    the solver's runtime policy; set it (e.g. `--env.verifier-runtime.type prime
-    --env.verifier-runtime.vm true`) when the verifier needs different placement
-    than the agent."""
-    verifier_retries: int = Field(2, ge=0)
-    """Extra attempts at provisioning-and-grading the separate box before the
-    episode fails. Grading is deterministic; what these retry is the
-    infrastructure around it (image pulls, provisioning)."""
+class HarborEnvConfig(IsolatedVerifierEnvConfig):
+    """The Harbor solver plus its optional independent verifier runtime."""
+
+    trust_compose: bool = False
+    """Allow local Compose tasks to use host files and Docker privileges. Only enable
+    for trusted task packages; Compose definitions are executable infrastructure."""
 
 
-class HarborEnv(vf.Env[HarborEnvConfig]):
+class HarborEnv(IsolatedVerifierEnv, vf.Env[HarborEnvConfig]):
     async def run(self, task: vf.Task, agents: vf.Agents) -> None:
         if not isinstance(task, HarborTask):
             raise TypeError(
                 f"the harbor env runs harbor tasks; got {type(task).__name__}"
             )
-        if task.data.verifier is None:
-            await agents.agent.run(task)
+        separate = task.data.verifier is not None
+        if separate:
+            # Resolve the verifier's box before the solve, so an impossible pairing
+            # (e.g. an invalid network policy) costs nothing
+            # rather than a full agent run.
+            self.verifier_config(task)
+            task = task.defer_scoring()
+        if not (Path(task.data.task_dir) / "environment/docker-compose.yaml").is_file():
+            await agents.agent.run(task, collect_artifacts=separate)
             return
-        # Resolve the verifier's box before the solve, so an impossible pairing
-        # (e.g. a restricted Prime verifier without vm=true) costs nothing
-        # rather than a full agent run.
-        self._verifier_config(task)
-        await agents.agent.run(task.graded_elsewhere())
+        timeouts = resolve_rollout_timeouts(agents.agent.timeout, task)
+        async with compose_services(
+            resolve_runtime_config(agents.agent.runtime_config, task),
+            task,
+            trust_compose=self.config.trust_compose,
+            setup_timeout=timeouts.setup,
+        ) as (services, stop_main):
+            # Ordered like the hooks, which Harbor runs as authored.
+            declared = dict.fromkeys(
+                entry.service for entry in (*task.data.collect, *task.data.artifacts)
+            )
+            if missing := declared.keys() - services.keys():
+                raise ValueError(f"Unknown Compose services: {sorted(missing)}")
+            trace = await agents.agent.run(
+                task, runtime=services["main"], collect_artifacts=separate
+            )
+            sidecars = {name: services[name] for name in declared if name != "main"}
+            if separate and trace.ok and sidecars:
+                # As in Harbor, main stops after its own collection so leftover agent
+                # processes cannot interfere with sidecar evidence.
+                async with (
+                    boundary(TaskError, "collecting Compose sidecars"),
+                    asyncio.timeout(timeouts.finalize),
+                ):
+                    await stop_main()
+                    await task.finalize(trace, services["main"], sidecars)
 
-    def _verifier_config(self, task: HarborTask) -> RuntimeConfig:
+    def verifier_config(self, task: HarborTask) -> RuntimeConfig:
         base = (
-            self.config.verifier_runtime
-            if self.config.verifier_runtime is not None
+            self.config.verifier.runtime
+            if self.config.verifier.runtime is not None
             else self.config.agent.runtime
         )
         return resolve_runtime_config(base, HarborTask(verifier_box_data(task.data)))
@@ -73,55 +96,43 @@ class HarborEnv(vf.Env[HarborEnvConfig]):
         Provision a fresh box from the task's verifier declaration, restore the
         solver's collected artifacts, stage `tests/`, run the verifier, and record
         its rewards (and any extra reward.json keys as metrics) on the solver's
-        trace. Infrastructure failures retry per `verifier_retries`; the last one
-        fails the episode — a grading box that can't be reached must never read
-        as reward 0."""
+        trace. The grader is the task's own class, so a `HarborTask` subclass's
+        `setup` and `stage_verifier` run in the verifier box too. Setup,
+        restoration, staging, and scoring failures retry per `verifier.retries`;
+        the last one fails the episode."""
         if not isinstance(task, HarborTask) or task.data.verifier is None:
             return
         solution = episode.traces[0]
         if not solution.ok:
             return
-        grader = HarborTask(verifier_box_data(task.data))
-        scores = await self._grade(self._verifier_config(task), grader, solution)
+        runtime = solution.agent.runtime
+        if (
+            task.data.verifier_image is None
+            and runtime is not None
+            and runtime.borrowed
+        ):
+            # The verifier inherits the solver's image, which Compose resolves at
+            # startup (including local builds), as it does the workdir.
+            task = type(task)(
+                task.data.model_copy(
+                    update=runtime.model_dump(include={"image", "workdir"})
+                ),
+                task.config,
+            )
+        grader = type(task)(verifier_box_data(task.data), task.config)
+        scores, solution = await self.grade(
+            self.verifier_config(task),
+            grader,
+            solution,
+            scoring_timeout_covers_attempt=True,
+        )
         items = scores.items() if isinstance(scores, dict) else [("solved", scores)]
         for name, value in items:
             solution.record_reward(name, value)
+        episode.traces[0] = solution
 
-    async def _grade(
-        self, config: RuntimeConfig, grader: HarborTask, solution: vf.Trace
+    async def verify(
+        self, task: vf.Task, solution: vf.Trace, runtime: Runtime
     ) -> float | dict[str, float]:
-        last: Exception | None = None
-        for attempt in range(self.config.verifier_retries + 1):
-            if attempt:
-                delay = backoff(attempt - 1)
-                logger.warning(
-                    "harbor verifier attempt %d/%d failed (%s); retrying in %.1fs",
-                    attempt,
-                    self.config.verifier_retries + 1,
-                    last,
-                    delay,
-                )
-                await asyncio.sleep(delay)
-            try:
-                # The scoring deadline covers provisioning and grading, but not the
-                # box's teardown: a score already in hand must not be discarded
-                # because the teardown ran out the clock.
-                async with AsyncExitStack() as boxes:
-                    async with asyncio.timeout(grader.data.timeout.scoring):
-                        box = await boxes.enter_async_context(
-                            provision_runtime(config, env=grader.runtime_env())
-                        )
-                        await box.prepare_setup()
-                        await grader.setup(box)
-                        # Artifacts first, tests second: an artifact entry pointing
-                        # into /tests must not survive staging, which wipes and
-                        # rebuilds that directory.
-                        await restore(box, solution.state.artifacts)
-                        await grader._stage_tests(box, wipe=True)
-                        await box.prepare_execution([])
-                        scores = await grader._graded(box, solution)
-                    return scores
-            except Exception as e:  # noqa: BLE001 - each attempt's failure is retried
-                last = e
-        assert last is not None
-        raise last
+        assert isinstance(task, HarborTask)
+        return await task.run_verifier(runtime, solution)

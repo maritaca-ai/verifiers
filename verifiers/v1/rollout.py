@@ -32,6 +32,7 @@ from verifiers.v1.state import state_cls
 from verifiers.v1.task import Task
 from verifiers.v1.trace import AgentInfo, Trace, TraceTask
 from verifiers.v1.types import Messages, Request, Response, SystemMessage, UserMessage
+from verifiers.v1.utils.artifacts import collect
 from verifiers.v1.utils.decorators import discover_decorated, invoke
 
 logger = logging.getLogger(__name__)
@@ -42,7 +43,7 @@ class RolloutTimeouts:
     """Per-stage rollout timeouts, each bounding one rollout stage."""
 
     setup: float | None = None
-    """Timeout (in seconds) for the task + harness setup hooks."""
+    """Timeout (in seconds) for task/harness setup through session preparation."""
     agent: float | None = None
     """Timeout (in seconds) for the agent's solve attempt."""
     finalize: float | None = None
@@ -69,6 +70,7 @@ class Rollout:
         interception: Interception | None = None,
         runtime: Runtime | None = None,
         on_trace: Callable[[Trace], None] | None = None,
+        collect_artifacts: bool = False,
     ) -> None:
         self.task = task
         self.harness = harness
@@ -80,8 +82,8 @@ class Rollout:
         self._shared_tools = shared_tools or {}
         self._interception = interception
         self.runtime = runtime
-        self._owns_runtime = runtime is None
-        self._previous_runtime_env: dict[str, str] | None = None
+        self._borrowed_runtime = runtime
+        self._collect_artifacts = collect_artifacts
         self.trace: Trace = Trace(
             task=TraceTask(
                 type=type(task).__name__,
@@ -105,14 +107,12 @@ class Rollout:
             ctx=ctx,
             trace=self.trace,
             network_policy=(
-                runtime_config
+                NetworkPolicyConfig(allow=[])
+                if isinstance(runtime_config, ModalConfig)
+                and not runtime_config.network_access
+                else runtime_config
                 if isinstance(runtime_config, NetworkPolicyConfig)
-                else NetworkPolicyConfig(
-                    allow=[]
-                    if isinstance(runtime_config, ModalConfig)
-                    and not runtime_config.network_access
-                    else ["*"]
-                )
+                else NetworkPolicyConfig()
             ),
             trace_stops=[fn for boundary, fn in stops if boundary is Trace],
             limits=limits,
@@ -124,6 +124,7 @@ class Rollout:
             ],
             request_stops=[fn for boundary, fn in stops if boundary is Request],
             response_stops=[fn for boundary, fn in stops if boundary is Response],
+            gates_tools=harness.SUPPORTS_TOOL_INTERCEPTION,
         )
         self._stack = AsyncExitStack()
         self._failed = False
@@ -158,12 +159,12 @@ class Rollout:
         """Record `error` as this rollout's outcome (captured onto the trace, the
         remaining stages skipped) — the run's owner reporting a failure the run
         itself couldn't see, e.g. its user raising between segments."""
-        if not self._owns_runtime and self.runtime is not None and self.runtime.stopped:
+        if self._borrowed_runtime is not None and self._borrowed_runtime.stopped:
             # The owner tore the borrowed box down mid-run — a lifetime bug in the
             # borrowing program: raise to the caller instead of capturing a
             # misattributed error onto the trace.
             raise ValueError(
-                f"borrowed runtime {self.runtime.name!r} was torn down by its owner "
+                f"borrowed runtime {self._borrowed_runtime.name!r} was torn down by its owner "
                 "mid-run; keep the provisioning context open until every run "
                 "placed into the box has completed"
             ) from error
@@ -173,11 +174,11 @@ class Rollout:
         self._failure = error
         self.trace.record_error(error)
 
-    def _release_borrowed_runtime(self) -> None:
-        if self._previous_runtime_env is not None and self.runtime is not None:
-            self.runtime.env = self._previous_runtime_env
-            self._previous_runtime_env = None
-            self.runtime.borrow_lock.release()
+    def timeout(self, stage: str) -> None:
+        """Record `stage`'s expired deadline as this rollout's outcome: a stop, not
+        a failure — no further segments run, but finalize and scoring still do."""
+        logger.info("rollout %s: %s timeout", self.trace.id, stage)
+        self.trace.record_timeout(stage)
 
     async def open(self) -> bool:
         """Boot the rollout's world up to the point where segments can run: start
@@ -186,9 +187,10 @@ class Rollout:
         proceed; a setup failure is captured onto the trace."""
         self._opened = True
         self.trace.timing.boot.start = time.time()
-        if self._owns_runtime:
+        self.trace.notify()
+        if self._borrowed_runtime is None:
             self.runtime = make_runtime(self.runtime_config, name=self.trace.id)
-        elif self.runtime.stopped:
+        elif self._borrowed_runtime is not None and self._borrowed_runtime.stopped:
             # A lifetime bug in the borrowing program: raise to the caller instead
             # of capturing onto the trace.
             raise ValueError(
@@ -206,42 +208,42 @@ class Rollout:
             self.harness.config.name,
             self.runtime_config.type,
         )
+        loop = asyncio.get_running_loop()
+        setup_timeout: asyncio.Timeout | None = None
         try:
             runtime_env = dict(self.task.runtime_env())
-            if self._owns_runtime:
+            if self._borrowed_runtime is None:
                 runtime.env = runtime_env
             else:
-                await runtime.borrow_lock.acquire()
-                self._previous_runtime_env = runtime.env
-                # The owner's defaults return after the borrow; they do not belong to
-                # this task and must not flow into its processes.
-                runtime.env = runtime_env
+                runtime = runtime.with_env(runtime_env)
+                self.runtime = runtime
             if self.task.data.prompt is None and not self._has_user:
                 raise TaskError(
                     "task has no prompt and no user to open the conversation; set "
                     "task.prompt, or drive the run through agent.interaction() and open "
                     "it with the first turn(message)"
                 )
-            if self._owns_runtime:
+            if self._borrowed_runtime is None:
                 await runtime.start()
             await runtime.prepare_setup()
             now = time.time()
             self.trace.timing.boot.end = now
             self.trace.timing.setup.start = now
-            # Task setup and harness provisioning share one setup-stage deadline.
+            self.trace.notify()
+            # Setup hooks and harness session preparation share one deadline.
             setup_deadline = (
                 None
                 if self._timeouts.setup is None
-                else asyncio.get_running_loop().time() + self._timeouts.setup
+                else loop.time() + self._timeouts.setup
             )
             async with (
+                asyncio.timeout_at(setup_deadline) as setup_timeout,
                 boundary(TaskError, "task setup"),
-                asyncio.timeout_at(setup_deadline),
             ):
                 await invoke(self.task.setup, {"trace": self.trace, "runtime": runtime})
             async with (
+                asyncio.timeout_at(setup_deadline) as setup_timeout,
                 boundary(HarnessError, "harness setup"),
-                asyncio.timeout_at(setup_deadline),
             ):
                 await self.harness.setup(runtime)
             async with boundary(ToolsetError, "building tool servers"):
@@ -263,7 +265,7 @@ class Rollout:
                     self._shared_tools,
                 )
             )
-            self._endpoint = f"{runtime.host_url(base_url)}/v1"
+            self._endpoint = runtime.host_url(f"{base_url.rstrip('/')}/v1")
             self._secret = model_secret
             self._urls = await self._stack.enter_async_context(
                 serve_tools(
@@ -278,7 +280,10 @@ class Rollout:
             # Setup and service provisioning are complete. Apply the runtime's
             # execution policy while preserving the framework routes the agent uses.
             await runtime.prepare_execution([self._endpoint, *self._urls.values()])
-            async with boundary(HarnessError, "opening harness session"):
+            async with (
+                asyncio.timeout_at(setup_deadline) as setup_timeout,
+                boundary(HarnessError, "opening harness session"),
+            ):
                 harness_data = self.trace.task.data
                 if (
                     self._session.request_interceptors
@@ -321,7 +326,11 @@ class Rollout:
                     )
                 if not self._session.stopped:
                     session_kwargs = (
-                        {"tool_interception_url": f"{runtime.host_url(base_url)}/tool"}
+                        {
+                            "tool_interception_url": runtime.host_url(
+                                f"{base_url.rstrip('/')}/tool"
+                            )
+                        }
                         if self.harness.SUPPORTS_TOOL_INTERCEPTION
                         and (
                             self._session.request_interceptors
@@ -339,6 +348,14 @@ class Rollout:
                         harness_data,
                         **session_kwargs,
                     )
+        except TimeoutError as e:
+            # Only an expired setup context owns the timeout; I/O between these
+            # contexts can time out independently after the deadline passes.
+            if setup_timeout is not None and setup_timeout.expired():
+                self.timeout("setup")
+            else:
+                self.fail(e)
+            return False
         except Exception as e:  # noqa: BLE001 - setup boundary records every rollout failure
             self.fail(e)
             return False
@@ -351,6 +368,7 @@ class Rollout:
         now = time.time()
         self.trace.timing.setup.end = now
         self.trace.timing.agent.start = now
+        self.trace.notify()
         return not self._session.stopped
 
     async def step(self, messages: Messages | None = None) -> bool:
@@ -365,6 +383,8 @@ class Rollout:
             return False
         trace = self.trace
         turns_before = trace.num_turns
+        root_reply_before = trace.root_reply
+        trace.root_reply = None
         loop = asyncio.get_running_loop()
         segment_start = loop.time()
         self.deadline_at = (
@@ -386,16 +406,11 @@ class Rollout:
                         return False
                 await self._harness_session.turn(messages)
         except TimeoutError as e:
-            # An expired rollout deadline is the agent breaking its time budget —
-            # an agent failure, never a clean stop. A TimeoutError from the
-            # harness's own I/O with no expired deadline stays the raw failure.
+            # An expired rollout deadline is the agent breaking its time budget: a
+            # timeout stop. A TimeoutError from the harness's own I/O with no
+            # expired deadline stays the raw failure.
             if self.deadline_at is not None and (loop.time() >= self.deadline_at):
-                self.fail(
-                    HarnessError(
-                        f"agent timeout: rollout exceeded its "
-                        f"{self._timeouts.agent:g}s budget"
-                    )
-                )
+                self.timeout("agent")
             else:
                 self.fail(e)
             return False
@@ -410,14 +425,17 @@ class Rollout:
                 self.fail(e)
             return False
         finally:
+            if trace.num_turns == turns_before:
+                trace.root_reply = root_reply_before
             if self._agent_time_remaining is not None:
                 self._agent_time_remaining = max(
                     0.0, self._agent_time_remaining - (loop.time() - segment_start)
                 )
             self.deadline_at = None
-        if self._session.error is not None:
-            self.fail(self._session.error)
-            return False
+        # A harness that completes cleanly after a failed model call handled it (e.g. it
+        # ends its run on context overflow); the failure stays recorded on the call. A
+        # harness that dies on it surfaces the stashed error through the except above.
+        self._session.error = None
         # A segment that committed nothing can't be waiting on the user; treating
         # it as continuable would consult the user against a conversation that
         # never moved, forever.
@@ -437,8 +455,7 @@ class Rollout:
         if self.runtime is not None:
             with contextlib.suppress(Exception):
                 await self.harness.cleanup(self.trace, self.runtime)
-        self._release_borrowed_runtime()
-        if self._owns_runtime and self.runtime is not None:
+        if self._borrowed_runtime is None and self.runtime is not None:
             with contextlib.suppress(Exception):
                 await self.runtime.stop()
 
@@ -469,28 +486,44 @@ class Rollout:
             finally:
                 if trace.timing.agent.start and not trace.timing.agent.end:
                     trace.timing.agent.end = time.time()
+                trace.notify()
             if not self._failed and self._opened:
+                assert runtime is not None
                 trace.timing.finalize.start = time.time()
-                async with boundary(TaskError, "task finalize"):
-                    await asyncio.wait_for(
-                        invoke(
+                try:
+                    async with (
+                        asyncio.timeout(self._timeouts.finalize),
+                        boundary(TaskError, "task finalize"),
+                    ):
+                        await invoke(
                             self.task.finalize, {"trace": trace, "runtime": runtime}
-                        ),
-                        self._timeouts.finalize,
-                    )
+                        )
+                        if self._collect_artifacts and not trace.state.artifacts:
+                            trace.state.artifacts = await collect(
+                                runtime,
+                                self.task.data.artifacts,
+                                max_bytes=self.task.data.artifact_max_bytes,
+                            )
+                except TimeoutError:
+                    self.timeout("finalize")
                 now = time.time()
                 trace.timing.finalize.end = now
                 trace.timing.scoring.start = now
-                async with boundary(TaskError, "scoring"):
-                    # Cross-trace judgement runs later, after the runtime is gone.
-                    await asyncio.wait_for(
-                        asyncio.gather(
+                trace.notify()
+                try:
+                    async with (
+                        asyncio.timeout(self._timeouts.scoring),
+                        boundary(TaskError, "scoring"),
+                    ):
+                        # Cross-trace judgement runs later, after the runtime is gone.
+                        await asyncio.gather(
                             self.task.score(trace, runtime),
                             self.harness.score(trace, runtime),
-                        ),
-                        self._timeouts.scoring,
-                    )
+                        )
+                except TimeoutError:
+                    self.timeout("scoring")
                 trace.timing.scoring.end = time.time()
+                trace.notify()
         except Exception as e:  # noqa: BLE001 - finalize boundary records every rollout failure
             self.fail(e)
         finally:
@@ -519,11 +552,10 @@ class Rollout:
                     logger.warning(
                         "harness cleanup failed (rollout %s)", trace.id, exc_info=True
                     )
-            self._release_borrowed_runtime()
             # Tear down here — the env's `score()` (later) needs only the traces,
             # not a live runtime. A borrowed runtime is its creator's to tear down,
             # not this rollout's.
-            if self._owns_runtime and runtime is not None:
+            if self._borrowed_runtime is None and runtime is not None:
                 try:
                     await runtime.stop()
                 except Exception:
