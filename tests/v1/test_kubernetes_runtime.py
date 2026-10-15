@@ -47,6 +47,8 @@ if cmd == "exec":
             sys.stderr.write("error: unable to upgrade connection: container not found\n"); sys.exit(1)
     if inner[:2] == ["cat", "/tmp/answer"]:
         sys.stdout.buffer.write(b"42\n"); sys.exit(0)
+    if inner[:2] == ["head", "-c"] and inner[3] == "/tmp/answer":
+        sys.stdout.buffer.write(b"42\n"[:int(inner[2])]); sys.exit(0)
     if inner[0] == "sh" and "cat >" in inner[2]:
         sys.exit(0)
     if inner[0] == "false":
@@ -96,11 +98,24 @@ def test_start_manifest_exec_env_write_read_teardown(fake_kubectl):
         out = await rt.run(["echo", "hi"], {"K": "v"})
         await rt.write("/tmp/a/b.txt", b"payload")
         data = await rt.read("/tmp/answer")
+        # Capped read: the base read() contract passes max_bytes to _read — the
+        # taskset status/reward reads use it (missing support = TypeError =
+        # every episode "agent died", exp2015 try 8).
+        capped = await rt.read("/tmp/answer", max_bytes=16)
+        from verifiers.v1.errors import SandboxError
+        try:
+            await rt.read("/tmp/answer", max_bytes=2)
+            overflow = False
+        except SandboxError:
+            overflow = True
         alive = await rt.alive()
         await rt.stop()
-        return out, data, alive
+        return out, data, alive, capped, overflow
 
-    out, data, alive = asyncio.run(flow())
+    out, data, alive, capped, overflow = asyncio.run(flow())
+    assert capped == b"42\n" and overflow is True
+    head_call = next(c for c in fake_kubectl() if "head" in c["args"])
+    assert head_call["args"][head_call["args"].index("head"):][:3] == ["head", "-c", "17"]
     calls = fake_kubectl()
     create = calls[0]
     assert create["args"][:2] == ["-n", "sandboxes"] and "--context" in create["args"]

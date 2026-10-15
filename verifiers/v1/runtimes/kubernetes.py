@@ -271,9 +271,15 @@ class KubernetesRuntime(Runtime):
         """The rollout itself: one attempt, never replayed (a replay would fork the trace)."""
         return await self._kubectl(*self._exec_argv(argv, self.process_env(env), stdin=False))
 
-    async def _read(self, path: str) -> bytes:
+    async def _read(self, path: str, max_bytes: int | None = None) -> bytes:
+        # `max_bytes` is the base `read()` contract (capped reads pass max+1 and
+        # check the overflow themselves): enforce it in the box with head -c.
+        # Without this parameter every capped read (the taskset's status file,
+        # reward.txt) raised TypeError — swallowed by the taskset's read guard
+        # into "agent died", 128/128 episodes of exp2015 try 8.
+        argv = ["cat", path] if max_bytes is None else ["head", "-c", str(int(max_bytes)), path]
         proc = await asyncio.create_subprocess_exec(
-            *self._base_args(), *self._exec_argv(["cat", path], {}, stdin=False),
+            *self._base_args(), *self._exec_argv(argv, {}, stdin=False),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await proc.communicate()
