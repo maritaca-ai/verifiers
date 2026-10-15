@@ -83,6 +83,11 @@ class KubernetesConfig(BaseConfig):
     """`runtimeClassName: gvisor` for untrusted code (tasks needing ptrace etc. break)."""
     node_selector: dict[str, str] = Field(default_factory=dict)
     labels: dict[str, str] = Field(default_factory=dict)
+    annotations: dict[str, str] = Field(default_factory=dict)
+    """Pod annotations. On GKE Autopilot the scale-down of an under-used node
+    evicts the sandboxes on it unless they carry
+    cluster-autoscaler.kubernetes.io/safe-to-evict: "false" (an evicted
+    sandbox is a SandboxError: the episode restarts from scratch)."""
     startup_timeout: float = Field(300.0, gt=0)
     """Seconds for the Pod to become Ready (cold image pulls dominate)."""
     max_lifetime: float = Field(6 * 3600.0, gt=0)
@@ -200,6 +205,7 @@ class KubernetesRuntime(Runtime):
             "metadata": {
                 "name": self._pod,
                 "labels": {"app": "vf-sandbox", **self.config.labels},
+                **({"annotations": dict(self.config.annotations)} if self.config.annotations else {}),
             },
             "spec": spec,
         }

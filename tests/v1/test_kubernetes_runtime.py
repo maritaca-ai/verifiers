@@ -86,7 +86,9 @@ def test_is_remote_and_registered():
 
 
 def test_start_manifest_exec_env_write_read_teardown(fake_kubectl):
-    rt = make_runtime(_cfg(labels={"run": "smoke"}, disk=2), name="vf-Test_01")
+    rt = make_runtime(_cfg(labels={"run": "smoke"}, disk=2,
+                           annotations={"cluster-autoscaler.kubernetes.io/safe-to-evict": "false"}),
+                      name="vf-Test_01")
     rt.env = {"TASK_VAR": "x y"}
 
     async def flow():
@@ -109,6 +111,7 @@ def test_start_manifest_exec_env_write_read_teardown(fake_kubectl):
     assert c["resources"]["requests"] == {"cpu": "1.0", "memory": "4096Mi", "ephemeral-storage": "2048Mi"}
     assert c["resources"]["limits"] == c["resources"]["requests"]
     assert manifest["metadata"]["labels"] == {"app": "vf-sandbox", "run": "smoke"}
+    assert manifest["metadata"]["annotations"] == {"cluster-autoscaler.kubernetes.io/safe-to-evict": "false"}
     assert calls[1]["args"][calls[1]["args"].index("wait"):][:2] == ["wait", "pod/vf-test-01"]
     ex = calls[2]["args"]
     prog = ex[ex.index("--") + 1:]
