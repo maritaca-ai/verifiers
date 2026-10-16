@@ -125,6 +125,11 @@ def test_start_manifest_exec_env_write_read_teardown(fake_kubectl):
     assert c["image"] == "registry/img:tag" and c["command"] == ["sleep", "infinity"]
     assert c["resources"]["requests"] == {"cpu": "1.0", "memory": "4096Mi", "ephemeral-storage": "2048Mi"}
     assert c["resources"]["limits"] == c["resources"]["requests"]
+    # requests below limits (Autopilot bursting): billed on the request, capped at the limit
+    burst = KubernetesRuntime(_cfg(cpu_request=0.25, memory_request=1.0, disk=2), name="vf-b")._manifest()
+    bc = burst["spec"]["containers"][0]["resources"]
+    assert bc["requests"] == {"cpu": "0.25", "memory": "1024Mi", "ephemeral-storage": "2048Mi"}
+    assert bc["limits"] == {"cpu": "1.0", "memory": "4096Mi", "ephemeral-storage": "2048Mi"}
     assert manifest["metadata"]["labels"] == {"app": "vf-sandbox", "run": "smoke"}
     assert manifest["metadata"]["annotations"] == {"cluster-autoscaler.kubernetes.io/safe-to-evict": "false"}
     assert calls[1]["args"][calls[1]["args"].index("wait"):][:2] == ["wait", "pod/vf-test-01"]

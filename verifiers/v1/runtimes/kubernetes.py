@@ -76,6 +76,14 @@ class KubernetesConfig(BaseConfig):
     memory: float | None = 4.0
     """Memory request (= limit) in GB."""
     disk: float | None = None
+    cpu_request: float | None = None
+    """Scheduling request for CPU when it should be below the limit (`cpu`); None =
+    request == limit. On GKE Autopilot billing follows requests and Pods may
+    burst to their limits, so an idle-mostly sandbox (a shell waiting on the
+    model) is cheap to request and still has its full ceiling."""
+    memory_request: float | None = None
+    """Scheduling request for memory in GiB below the limit (`memory`); None =
+    request == limit."""
     """Ephemeral-storage request in GB (None = the platform default)."""
     gpu: str | None = None
     """Unsupported here (kept for TaskResources symmetry): a task asking for a GPU is a loud error."""
@@ -175,19 +183,23 @@ class KubernetesRuntime(Runtime):
     def _manifest(self) -> dict:
         if self.config.gpu:
             raise SandboxError(f"kubernetes runtime: GPU requests are not supported ({self.config.gpu!r})")
+        limits: dict[str, str] = {}
         requests: dict[str, str] = {}
         if self.config.cpu is not None:
-            requests["cpu"] = str(self.config.cpu)
+            limits["cpu"] = str(self.config.cpu)
+            requests["cpu"] = str(self.config.cpu_request if self.config.cpu_request is not None else self.config.cpu)
         if (mem := _quantity(self.config.memory)) is not None:
-            requests["memory"] = mem
+            limits["memory"] = mem
+            requests["memory"] = _quantity(self.config.memory_request) if self.config.memory_request is not None else mem
         if (disk := _quantity(self.config.disk)) is not None:
+            limits["ephemeral-storage"] = disk
             requests["ephemeral-storage"] = disk
         container = {
             "name": "sandbox",
             "image": self.config.image,
             "command": ["sleep", "infinity"],
             "workingDir": "/",
-            "resources": {"requests": requests, "limits": requests},
+            "resources": {"requests": requests, "limits": limits},
         }
         spec: dict = {
             "containers": [container],
