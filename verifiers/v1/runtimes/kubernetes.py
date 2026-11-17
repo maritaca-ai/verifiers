@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import random
 import re
 import shlex
 import subprocess
@@ -57,8 +58,27 @@ _TRANSIENT = (
     "connection refused",
     "the server is currently unable to handle the request",
     "too many requests",
+    "failed calling webhook",
+)
+# The subset that fails BEFORE the command starts in the container: the exec
+# upgrade itself was refused (admission webhook, kubelet proxy). Retrying such
+# a failure cannot replay anything, so even the harness program may retry it.
+_PRE_START = (
+    "unable to upgrade connection",
+    "error dialing backend",
+    "no agent available",
+    "failed calling webhook",
 )
 _EXEC_PREFIX = "command terminated with exit code "
+_BACKOFF_CAP_S = 30.0
+
+
+def _backoff(attempt: int, base: float = 1.0) -> float:
+    """Exponential backoff with jitter. Under an overloaded admission webhook
+    (GKE Autopilot's `warden` on pods/exec times out at 10 s when the cluster
+    sees an exec storm) fixed short sleeps make every sandbox retry in lockstep
+    and exhaust their budget inside one slow window; spread and stretch them."""
+    return min(base * 2 ** attempt, _BACKOFF_CAP_S) * random.uniform(0.5, 1.5)
 
 
 class KubernetesConfig(BaseConfig):
@@ -101,9 +121,11 @@ class KubernetesConfig(BaseConfig):
     max_lifetime: float = Field(6 * 3600.0, gt=0)
     """Pod `activeDeadlineSeconds`: a sandbox whose owner died without tearing it down
     (env server killed mid-episode) stops consuming the cluster after this long."""
-    exec_retries: int = Field(3, ge=0)
-    """Retries for SHORT operations (write/read/infra `run`) on transient kubelet errors.
-    The harness program itself (`run_program`) is never replayed."""
+    exec_retries: int = Field(6, ge=0)
+    """Retries for SHORT operations (write/read/infra `run`) on transient kubelet errors,
+    with jittered exponential backoff capped at 30 s (~1-2 min of budget at the default).
+    The harness program itself (`run_program`) is retried only for failures that happen
+    before it starts (the exec upgrade was refused) — it is never replayed."""
 
 
 class KubernetesRuntimeInfo(KubernetesConfig, BaseRuntimeInfo):
@@ -164,6 +186,13 @@ class KubernetesRuntime(Runtime):
         err = result.stderr.lower()
         return result.exit_code != 0 and any(p.lower() in err for p in _TRANSIENT) \
             and _EXEC_PREFIX not in result.stderr
+
+    @staticmethod
+    def _not_started(result: ProgramResult) -> bool:
+        """The exec was refused before the command ran (nothing to replay)."""
+        err = result.stderr.lower()
+        return result.exit_code != 0 and not result.stdout and _EXEC_PREFIX not in result.stderr \
+            and any(p in err for p in _PRE_START)
 
     def _exec_argv(self, argv: list[str], env: dict[str, str], *, stdin: bool) -> list[str]:
         """`kubectl exec` has neither --env nor --workdir: both ride on a `sh -c` prelude.
@@ -236,7 +265,7 @@ class KubernetesRuntime(Runtime):
                 raise SandboxError(f"kubectl create pod failed: {created.stderr.strip()[-500:]}")
             logger.warning("kubernetes: create pod %s hit a transient API error (attempt %d): %s",
                            self._pod, attempt + 1, created.stderr.strip()[-160:])
-            await asyncio.sleep(min(3 * 2 ** attempt, 20))
+            await asyncio.sleep(_backoff(attempt, base=3.0))
         self._created = True
         self.info.id = self._pod
         ready = await self._kubectl(
@@ -276,12 +305,21 @@ class KubernetesRuntime(Runtime):
             result = await self._kubectl(*argv_k)
             if not self._transient(result) or attempt == self.config.exec_retries:
                 return result
-            await asyncio.sleep(min(2 ** attempt, 8))
+            await asyncio.sleep(_backoff(attempt))
         return result  # pragma: no cover
 
     async def run_program(self, argv: list[str], env: dict[str, str]) -> ProgramResult:
-        """The rollout itself: one attempt, never replayed (a replay would fork the trace)."""
-        return await self._kubectl(*self._exec_argv(argv, self.process_env(env), stdin=False))
+        """The rollout itself: never replayed (a replay would fork the trace). Only an exec
+        refused before the program started (`_not_started`) is attempted again."""
+        argv_k = self._exec_argv(argv, self.process_env(env), stdin=False)
+        for attempt in range(self.config.exec_retries + 1):
+            result = await self._kubectl(*argv_k)
+            if not self._not_started(result) or attempt == self.config.exec_retries:
+                return result
+            logger.warning("kubernetes: exec of the program in %s refused before start (attempt %d): %s",
+                           self._pod, attempt + 1, result.stderr.strip()[-160:])
+            await asyncio.sleep(_backoff(attempt))
+        return result  # pragma: no cover
 
     async def _read(self, path: str, max_bytes: int | None = None) -> bytes:
         # `max_bytes` is the base `read()` contract (capped reads pass max+1 and
@@ -290,14 +328,20 @@ class KubernetesRuntime(Runtime):
         # reward.txt) raised TypeError — swallowed by the taskset's read guard
         # into "agent died", 128/128 episodes of exp2015 try 8.
         argv = ["cat", path] if max_bytes is None else ["head", "-c", str(int(max_bytes)), path]
-        proc = await asyncio.create_subprocess_exec(
-            *self._base_args(), *self._exec_argv(argv, {}, stdin=False),
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise SandboxError(f"read {path!r}: {stderr.decode(errors='replace').strip()[-500:]}")
-        return stdout
+        for attempt in range(self.config.exec_retries + 1):
+            proc = await asyncio.create_subprocess_exec(
+                *self._base_args(), *self._exec_argv(argv, {}, stdin=False),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode == 0:
+                return stdout
+            failed = ProgramResult(exit_code=proc.returncode or 1, stdout="",
+                                   stderr=stderr.decode(errors="replace"))
+            if not self._transient(failed) or attempt == self.config.exec_retries:
+                raise SandboxError(f"read {path!r}: {failed.stderr.strip()[-500:]}")
+            await asyncio.sleep(_backoff(attempt))
+        raise AssertionError("unreachable")  # pragma: no cover
 
     async def write(self, path: str, data: bytes) -> None:
         parent = shlex.quote(str(PurePosixPath(path).parent))
@@ -308,7 +352,7 @@ class KubernetesRuntime(Runtime):
                 return
             if not self._transient(result) or attempt == self.config.exec_retries:
                 raise SandboxError(f"write {path!r}: {result.stderr.strip()[-500:]}")
-            await asyncio.sleep(min(2 ** attempt, 8))
+            await asyncio.sleep(_backoff(attempt))
 
     async def alive(self) -> bool:
         phase = await self._kubectl("get", f"pod/{self._pod}", "-o", "jsonpath={.status.phase}")

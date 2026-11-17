@@ -13,6 +13,8 @@ from pathlib import Path
 import pytest
 
 from verifiers.v1.runtimes import KubernetesConfig, make_runtime, runtime_is_local
+import verifiers.v1.runtimes.kubernetes as kubernetes_mod
+from verifiers.v1.errors import SandboxError
 from verifiers.v1.runtimes.kubernetes import KubernetesRuntime
 
 FAKE_KUBECTL = r'''#!/usr/bin/env python3
@@ -44,7 +46,11 @@ if cmd == "exec":
         n = int(open(marker).read() or "0") if os.path.exists(marker) else 0
         open(marker, "w").write(str(n + 1))
         if n < fail_first:
-            sys.stderr.write("error: unable to upgrade connection: container not found\n"); sys.exit(1)
+            if os.environ.get("FAKE_EXEC_PARTIAL_STDOUT"):
+                sys.stdout.write("partial output\n")
+            sys.stderr.write(os.environ.get("FAKE_EXEC_TRANSIENT_MSG",
+                                            "error: unable to upgrade connection: container not found") + "\n")
+            sys.exit(1)
     if inner[:2] == ["cat", "/tmp/answer"]:
         sys.stdout.buffer.write(b"42\n"); sys.exit(0)
     if inner[:2] == ["head", "-c"] and inner[3] == "/tmp/answer":
@@ -70,6 +76,9 @@ def fake_kubectl(tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_KUBECTL_LOG", str(log))
     monkeypatch.setenv("FAKE_EXEC_COUNTER", str(tmp_path / "counter"))
     monkeypatch.delenv("FAKE_EXEC_TRANSIENT_FIRST", raising=False)
+    monkeypatch.delenv("FAKE_EXEC_TRANSIENT_MSG", raising=False)
+    monkeypatch.delenv("FAKE_EXEC_PARTIAL_STDOUT", raising=False)
+    monkeypatch.setattr(kubernetes_mod, "_backoff", lambda attempt, base=1.0: 0.0)
 
     def calls():
         return [json.loads(l) for l in log.read_text().splitlines()] if log.exists() else []
@@ -144,7 +153,12 @@ def test_start_manifest_exec_env_write_read_teardown(fake_kubectl):
     assert any("delete" in c["args"] and "--grace-period=0" in c["args"] for c in calls)
 
 
-def test_transient_exec_is_retried_but_program_is_not(fake_kubectl, monkeypatch):
+WEBHOOK_TIMEOUT = ('error: unable to upgrade connection: Internal error occurred: failed calling webhook '
+                   '"warden-validating.common-webhooks.networking.gke.io": failed to call webhook: '
+                   'Post "https://localhost:5443/webhook/warden-validating?timeout=10s": context deadline exceeded')
+
+
+def test_transient_exec_is_retried_and_program_retries_only_refused_starts(fake_kubectl, monkeypatch):
     rt = make_runtime(_cfg(exec_retries=2), name="vf-r")
     monkeypatch.setenv("FAKE_EXEC_TRANSIENT_FIRST", "1")
 
@@ -152,14 +166,68 @@ def test_transient_exec_is_retried_but_program_is_not(fake_kubectl, monkeypatch)
         await rt.start()
         first = await rt.run(["echo", "ok"], {})          # 1 transient failure, then success
         monkeypatch.setenv("FAKE_EXEC_COUNTER", str(Path(os.environ["FAKE_EXEC_COUNTER"]).with_name("c2")))
-        prog = await rt.run_program(["echo", "ok"], {})   # program: single attempt
+        prog = await rt.run_program(["echo", "ok"], {})   # refused before start: retried, nothing replayed
         return first, prog
 
     first, prog = asyncio.run(flow())
-    assert first.exit_code == 0
-    assert prog.exit_code == 1 and "unable to upgrade connection" in prog.stderr
+    assert first.exit_code == 0 and prog.exit_code == 0 and "ran: echo ok" in prog.stdout
     execs = [c for c in fake_kubectl() if "exec" in c["args"]]
-    assert len(execs) == 3  # 2 for run (retry once) + 1 for run_program
+    assert len(execs) == 4  # 2 for run + 2 for run_program
+
+
+def test_webhook_timeout_is_retried_for_program_read_and_write(fake_kubectl, monkeypatch):
+    rt = make_runtime(_cfg(exec_retries=3), name="vf-w")
+    monkeypatch.setenv("FAKE_EXEC_TRANSIENT_MSG", WEBHOOK_TIMEOUT)
+    counters = iter(range(100))
+
+    def fail_next(n):
+        monkeypatch.setenv("FAKE_EXEC_COUNTER", str(Path(os.environ["FAKE_EXEC_COUNTER"]).with_name(f"w{next(counters)}")))
+        monkeypatch.setenv("FAKE_EXEC_TRANSIENT_FIRST", str(n))
+
+    async def flow():
+        await rt.start()
+        fail_next(2)
+        prog = await rt.run_program(["echo", "ok"], {})
+        fail_next(2)
+        await rt.write("/tmp/x", b"data")
+        fail_next(2)
+        data = await rt.read("/tmp/answer")
+        return prog, data
+
+    prog, data = asyncio.run(flow())
+    assert prog.exit_code == 0 and data == b"42\n"
+
+
+def test_program_failure_after_start_is_not_replayed(fake_kubectl, monkeypatch):
+    rt = make_runtime(_cfg(exec_retries=3), name="vf-p")
+
+    async def flow():
+        await rt.start()
+        monkeypatch.setenv("FAKE_EXEC_TRANSIENT_FIRST", "1")
+        monkeypatch.setenv("FAKE_EXEC_PARTIAL_STDOUT", "1")      # the program had started and printed
+        started = await rt.run_program(["echo", "ok"], {})
+        monkeypatch.setenv("FAKE_EXEC_COUNTER", str(Path(os.environ["FAKE_EXEC_COUNTER"]).with_name("c3")))
+        monkeypatch.delenv("FAKE_EXEC_PARTIAL_STDOUT")
+        monkeypatch.setenv("FAKE_EXEC_TRANSIENT_MSG", "error: unexpected EOF")  # mid-stream loss
+        mid = await rt.run_program(["echo", "ok"], {})
+        return started, mid
+
+    started, mid = asyncio.run(flow())
+    assert started.exit_code == 1 and mid.exit_code == 1
+    assert len([c for c in fake_kubectl() if "exec" in c["args"]]) == 2
+
+
+def test_read_exhausts_retries_into_sandbox_error(fake_kubectl, monkeypatch):
+    rt = make_runtime(_cfg(exec_retries=2), name="vf-x")
+
+    async def flow():
+        await rt.start()
+        monkeypatch.setenv("FAKE_EXEC_TRANSIENT_FIRST", "99")
+        await rt.read("/tmp/answer")
+
+    with pytest.raises(SandboxError, match="read"):
+        asyncio.run(flow())
+    assert len([c for c in fake_kubectl() if "exec" in c["args"]]) == 3
 
 
 def test_nonzero_command_exit_is_not_retried(fake_kubectl):
