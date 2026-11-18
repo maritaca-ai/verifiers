@@ -25,6 +25,11 @@ from verifiers.v1.runtimes.docker import (
     PodmanRuntime,
     PodmanRuntimeInfo,
 )
+from verifiers.v1.runtimes.kubernetes import (
+    KubernetesConfig,
+    KubernetesRuntime,
+    KubernetesRuntimeInfo,
+)
 from verifiers.v1.runtimes.modal import ModalConfig, ModalRuntime, ModalRuntimeInfo
 from verifiers.v1.runtimes.prime import (
     PrimeConfig,
@@ -44,7 +49,8 @@ RuntimeConfig = Annotated[
     | PodmanConfig
     | ApptainerConfig
     | PrimeConfig
-    | ModalConfig,
+    | ModalConfig
+    | KubernetesConfig,
     Field(discriminator="type"),
 ]
 
@@ -54,7 +60,8 @@ RuntimeInfo = Annotated[
     | PodmanRuntimeInfo
     | ApptainerRuntimeInfo
     | PrimeRuntimeInfo
-    | ModalRuntimeInfo,
+    | ModalRuntimeInfo
+    | KubernetesRuntimeInfo,
     Field(discriminator="type"),
 ]
 
@@ -67,6 +74,7 @@ def _runtime_cls(config: RuntimeConfig) -> type[Runtime]:
         "apptainer": ApptainerRuntime,
         "prime": PrimeRuntime,
         "modal": ModalRuntime,
+        "kubernetes": KubernetesRuntime,
     }[config.type]
 
 
@@ -109,6 +117,9 @@ __all__ = [
     "DockerConfig",
     "DockerRuntime",
     "DockerRuntimeInfo",
+    "KubernetesConfig",
+    "KubernetesRuntime",
+    "KubernetesRuntimeInfo",
     "ModalConfig",
     "ModalRuntime",
     "ModalRuntimeInfo",
