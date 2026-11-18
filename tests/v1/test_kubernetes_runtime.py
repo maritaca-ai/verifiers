@@ -257,3 +257,34 @@ def test_gpu_request_rejected(fake_kubectl):
     rt = make_runtime(_cfg(gpu="A100"), name="vf-g")
     with pytest.raises(SandboxError, match="GPU"):
         asyncio.run(rt.start())
+
+
+def test_admission_cap_bounds_in_flight_short_calls(monkeypatch):
+    """`exec_concurrency` caps concurrent short kubectl calls process-wide (across
+    runtimes), and a retrying call releases its slot while it sleeps."""
+    from verifiers.v1.runtimes.base import ProgramResult
+
+    state = {"now": 0, "peak": 0, "failed_once": set()}
+
+    async def fake_kubectl(self, *args, stdin=None):
+        state["now"] += 1
+        state["peak"] = max(state["peak"], state["now"])
+        await asyncio.sleep(0.01)
+        state["now"] -= 1
+        if self._pod not in state["failed_once"]:  # every runtime's first call is transient
+            state["failed_once"].add(self._pod)
+            return ProgramResult(exit_code=1, stdout="", stderr="error: unable to upgrade connection: x")
+        return ProgramResult(exit_code=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(KubernetesRuntime, "_kubectl", fake_kubectl)
+    rts = [KubernetesRuntime(_cfg(exec_concurrency=3, exec_retries=1), name=f"vf-c{i}") for i in range(12)]
+
+    async def flow():
+        results = await asyncio.gather(*(rt.run(["true"], {}) for rt in rts),
+                                       *(rt.write("/tmp/x", b"y") for rt in rts))
+        return results
+
+    results = asyncio.run(flow())
+    assert all(r is None or r.exit_code == 0 for r in results)
+    assert state["peak"] == 3
+

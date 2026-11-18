@@ -126,6 +126,33 @@ class KubernetesConfig(BaseConfig):
     with jittered exponential backoff capped at 30 s (~1-2 min of budget at the default).
     The harness program itself (`run_program`) is retried only for failures that happen
     before it starts (the exec upgrade was refused) — it is never replayed."""
+    exec_concurrency: int = Field(16, ge=0)
+    """Process-wide cap on in-flight SHORT kubectl calls that pass the cluster's
+    admission webhooks (exec for write/read/`run`, and pod create); 0 = no cap.
+    Retries and backoff survive an overloaded webhook; this cap keeps a process
+    from overloading it. On GKE Autopilot every pods/exec CONNECT goes through
+    the warden admission webhook (10 s timeout), and the cluster serves exec at
+    only ~6-7/s (tmax-sandbox, 2026-11-18: 100 concurrent execs took 17 s; 100
+    gets took 1.3 s). An exec still queued there after 10 s fails, and its
+    retries keep the queue full: a step-start burst of ~200 new pods x ~5 setup
+    execs took exec down for an hour (exp2116). Waiting here keeps the server
+    queue short while its throughput stays saturated. The cap is per process
+    (per event loop): size it for every process that shares the cluster.
+    `run_program` (long-lived) and `kubectl wait` are not capped."""
+
+
+# One semaphore per (event loop, cap): asyncio primitives are bound to their loop.
+_ADMISSION_SLOTS: dict[tuple[int, int], asyncio.Semaphore] = {}
+
+
+def _admission_slot(cap: int) -> contextlib.AbstractAsyncContextManager:
+    if cap <= 0:
+        return contextlib.nullcontext()
+    key = (id(asyncio.get_running_loop()), cap)
+    sem = _ADMISSION_SLOTS.get(key)
+    if sem is None:
+        sem = _ADMISSION_SLOTS[key] = asyncio.Semaphore(cap)
+    return sem
 
 
 class KubernetesRuntimeInfo(KubernetesConfig, BaseRuntimeInfo):
@@ -180,6 +207,12 @@ class KubernetesRuntime(Runtime):
             stdout=stdout.decode(errors="replace"),
             stderr=stderr.decode(errors="replace"),
         )
+
+    async def _kubectl_admitted(self, *args: str, stdin: bytes | None = None) -> ProgramResult:
+        """`_kubectl` under the process-wide admission cap (see `exec_concurrency`).
+        The slot is held only while the call runs, never across retry sleeps."""
+        async with _admission_slot(self.config.exec_concurrency):
+            return await self._kubectl(*args, stdin=stdin)
 
     @staticmethod
     def _transient(result: ProgramResult) -> bool:
@@ -258,7 +291,7 @@ class KubernetesRuntime(Runtime):
         # `dial tcp ...: i/o timeout` / TLS handshake timeout — retry the create
         # itself with backoff (idempotent: a name clash means it did land).
         for attempt in range(self.config.exec_retries + 1):
-            created = await self._kubectl("create", "-f", "-", stdin=manifest)
+            created = await self._kubectl_admitted("create", "-f", "-", stdin=manifest)
             if created.exit_code == 0 or "AlreadyExists" in created.stderr:
                 break
             if attempt == self.config.exec_retries or not self._transient(created):
@@ -302,7 +335,7 @@ class KubernetesRuntime(Runtime):
         env = self.process_env(env)
         argv_k = self._exec_argv(argv, env, stdin=False)
         for attempt in range(self.config.exec_retries + 1):
-            result = await self._kubectl(*argv_k)
+            result = await self._kubectl_admitted(*argv_k)
             if not self._transient(result) or attempt == self.config.exec_retries:
                 return result
             await asyncio.sleep(_backoff(attempt))
@@ -329,11 +362,19 @@ class KubernetesRuntime(Runtime):
         # into "agent died", 128/128 episodes of exp2015 try 8.
         argv = ["cat", path] if max_bytes is None else ["head", "-c", str(int(max_bytes)), path]
         for attempt in range(self.config.exec_retries + 1):
-            proc = await asyncio.create_subprocess_exec(
-                *self._base_args(), *self._exec_argv(argv, {}, stdin=False),
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
+            async with _admission_slot(self.config.exec_concurrency):
+                proc = await asyncio.create_subprocess_exec(
+                    *self._base_args(), *self._exec_argv(argv, {}, stdin=False),
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    stdout, stderr = await proc.communicate()
+                except BaseException:
+                    if proc.returncode is None:
+                        with contextlib.suppress(ProcessLookupError):
+                            proc.kill()
+                    await run_shielded(proc.communicate())
+                    raise
             if proc.returncode == 0:
                 return stdout
             failed = ProgramResult(exit_code=proc.returncode or 1, stdout="",
@@ -347,7 +388,7 @@ class KubernetesRuntime(Runtime):
         parent = shlex.quote(str(PurePosixPath(path).parent))
         cmd = ["sh", "-c", f"mkdir -p {parent} && cat > {shlex.quote(path)}"]
         for attempt in range(self.config.exec_retries + 1):
-            result = await self._kubectl(*self._exec_argv(cmd, {}, stdin=True), stdin=data)
+            result = await self._kubectl_admitted(*self._exec_argv(cmd, {}, stdin=True), stdin=data)
             if result.exit_code == 0:
                 return
             if not self._transient(result) or attempt == self.config.exec_retries:
